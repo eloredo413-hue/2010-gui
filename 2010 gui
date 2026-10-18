@@ -12,6 +12,10 @@
 local SHOW_CHAT_BUBBLES = false
 -- Also switch the game's own on-screen text (PlayerGui) to the 2006 font. Text boxes are never touched.
 local APPLY_2006_FONT_TO_GAME_GUIS = true
+-- Also switch other executor scripts' text to the 2006 font: the Bloxy Paradox loader's NPC
+-- dialog box, notices and dialog bubbles, and anything drawn over heads (health bar ESPs,
+-- name tags). Executor menus are left alone, so their code editors keep their own fonts.
+local APPLY_2006_FONT_TO_OTHER_SCRIPTS = true
 -- Also switch signs and name tags in the world (BillboardGui / SurfaceGui) to the 2006 font.
 local APPLY_2006_FONT_TO_WORLD_TEXT = false
 -- Also switch Roblox's own menus and pop-ups (CoreGui) to the 2006 font.
@@ -1491,8 +1495,12 @@ updatePlayerList()
 --========================================================
 -- HEALTH BAR
 --========================================================
--- 2006 style, measured off RetroStudio on a phone: a thin green bar a little in
--- from the right edge, with "Health" in blue in the 2006 font right under it
+-- 2006 style, sized off RetroStudio on a phone: a thin green bar with "Health" in
+-- blue in the 2006 font right under it, standing over the camera buttons in the
+-- bottom-right corner (36 from the edge lines it up with their middle).
+-- How far up the bottom of "Health" sits: just over the camera buttons (their top is
+-- 100 up), or higher on touch screens so it stays clear of Roblox's jump button.
+local HEALTH_LABEL_BOTTOM = UserInputService.TouchEnabled and 150 or 106
 local HEALTH_GREEN =
 	Color3.new(
 		0.5058824,
@@ -1501,8 +1509,9 @@ local HEALTH_GREEN =
 	)
 local HealthFrame = Instance.new("Frame")
 HealthFrame.Name = "ClassicHealthFrame"
-HealthFrame.AnchorPoint = Vector2.new(0.5, 0)
-HealthFrame.Position = UDim2.new(0.877, 0, 0.556, 0)
+HealthFrame.AnchorPoint = Vector2.new(0.5, 1)
+-- the label hangs 2 + 25 below the bar
+HealthFrame.Position = UDim2.new(1, -36, 1, -(HEALTH_LABEL_BOTTOM + 27))
 HealthFrame.Size = UDim2.new(0, 7, 0, 82)
 HealthFrame.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
 HealthFrame.BorderSizePixel = 0
@@ -2277,13 +2286,13 @@ local RightPalette = Instance.new("Frame")
 RightPalette.Name = "RightPalette"
 RightPalette.AnchorPoint = Vector2.new(1, 1)
 RightPalette.Position = UDim2.new(1, -12, 1, -32)
-RightPalette.Size = UDim2.new(0, 48, 0, 104)
+RightPalette.Size = UDim2.new(0, 48, 0, 68)
 RightPalette.BackgroundTransparency = 1
 RightPalette.Parent = ScreenGui
 
 local CameraPanel = Instance.new("Frame")
 CameraPanel.Name = "CameraPanel"
-CameraPanel.Position = UDim2.new(0, 0, 0, 36)
+CameraPanel.Position = UDim2.new(0, 0, 0, 0)
 CameraPanel.Size = UDim2.new(0, 48, 0, 48)
 CameraPanel.BackgroundTransparency = 1
 CameraPanel.Parent = RightPalette
@@ -2332,14 +2341,6 @@ ZoomOut.BackgroundTransparency = 1
 ZoomOut.Image = "rbxassetid://598665130"
 ZoomOut.Parent = CameraRight
 
-local ReportAbuse = Instance.new("ImageButton")
-ReportAbuse.Name = "ReportAbuse"
-ReportAbuse.Position = UDim2.new(0, 0, 0, -14)
-ReportAbuse.Size = UDim2.new(0, 48, 0, 48)
-ReportAbuse.BackgroundTransparency = 1
-ReportAbuse.Image = "rbxassetid://4539289774"
-ReportAbuse.Parent = RightPalette
-
 local STEP_ZOOM = 5
 local STEP_TILT = math.rad(5)
 
@@ -2381,15 +2382,6 @@ storeConnection(
 		elseif Camera then
 			Camera.CFrame = Camera.CFrame * CFrame.new(0, -2, 0)
 		end
-	end)
-)
-
-storeConnection(
-	ReportAbuse.MouseButton1Click:Connect(function()
-		local GuiService = game:GetService("GuiService")
-		pcall(function()
-			GuiService:OpenBrowserWindow("https://www.roblox.com/report-abuse")
-		end)
 	end)
 )
 
@@ -2608,7 +2600,7 @@ if LocalPlayer.Character then
 end
 
 --========================================================
--- 2006 FONT FOR THE GAME'S OWN TEXT
+-- 2006 FONT FOR THE GAME'S TEXT AND OTHER SCRIPTS' TEXT
 --========================================================
 -- In RetroStudio the game draws its own labels (marked with this font family) in the 2006 font itself
 local GAME_FONT_MARKER = "rbxasset://fonts/families/GothamSSm.json"
@@ -2622,12 +2614,39 @@ pcall(function()
 		and replicatedStorage:FindFirstChild("Protocols") ~= nil
 end)
 
-local function convertGameText(obj)
+-- GUIs made by the Bloxy Paradox loader: its NPC dialog box, notices and dialog bubbles.
+-- Add a GUI's name here to give another script's GUI the 2006 font too.
+local OTHER_SCRIPT_GUIS = {
+	ClassicDialogExecutorGui = true,
+	ClassicDialogNoticeGui = true,
+	ClassicDialogBillboardHost = true
+}
+
+-- Other scripts' text that's safe to restyle: anything drawn over a head or part
+-- (health bar ESPs, name tags, dialog bubbles) and the GUIs listed above
+local function isOtherScriptText(obj)
+	if obj:FindFirstAncestorWhichIsA("BillboardGui") then
+		return true
+	end
+	local node = obj.Parent
+	while node do
+		if OTHER_SCRIPT_GUIS[node.Name] then
+			return true
+		end
+		node = node.Parent
+	end
+	return false
+end
+
+local function convertGameText(obj, onlyOtherScriptText)
 	if fontStates[obj] or obj:GetAttribute("Classic2006Font") or obj:IsDescendantOf(ScreenGui) then
 		return
 	end
+	if onlyOtherScriptText and not isOtherScriptText(obj) then
+		return
+	end
 	-- Leave other executor GUIs alone (they share the hidden gethui() folder with this one)
-	if parentTarget ~= CoreGui and obj:IsDescendantOf(parentTarget) then
+	if parentTarget ~= CoreGui and obj:IsDescendantOf(parentTarget) and not isOtherScriptText(obj) then
 		return
 	end
 	-- Leave the game's chat alone, and text RetroStudio already draws in the 2006 font
@@ -2641,6 +2660,11 @@ local function convertGameText(obj)
 	if parent and parent:FindFirstChildWhichIsA("TextBox") then
 		return
 	end
+	-- Leave monospace text alone: code editors and consoles line up by character
+	local family = string.lower(obj.FontFace.Family)
+	if string.find(family, "mono", 1, true) or string.find(family, "inconsolata", 1, true) then
+		return
+	end
 	if IS_RETROSTUDIO and obj.FontFace.Family == GAME_FONT_MARKER then
 		return
 	end
@@ -2651,18 +2675,18 @@ local function isGameText(obj)
 	return obj:IsA("TextLabel") or obj:IsA("TextButton")
 end
 
-local function watchGameText(root)
+local function watchGameText(root, onlyOtherScriptText)
 	storeConnection(
 		root.DescendantAdded:Connect(function(obj)
 			if isGameText(obj) then
 				-- wait a moment so the game finishes setting the text up first
-				task.defer(pcall, convertGameText, obj)
+				task.defer(pcall, convertGameText, obj, onlyOtherScriptText)
 			end
 		end)
 	)
 	for index, obj in ipairs(root:GetDescendants()) do
 		if isGameText(obj) then
-			pcall(convertGameText, obj)
+			pcall(convertGameText, obj, onlyOtherScriptText)
 		end
 		-- a big GUI is taken over a bit at a time instead of freezing the game
 		if index % 200 == 0 then
@@ -2679,6 +2703,31 @@ if APPLY_2006_FONT_TO_WORLD_TEXT then
 end
 if APPLY_2006_FONT_TO_ROBLOX_MENUS then
 	task.spawn(watchGameText, CoreGui)
+end
+if APPLY_2006_FONT_TO_OTHER_SCRIPTS then
+	if not APPLY_2006_FONT_TO_ROBLOX_MENUS then
+		task.spawn(watchGameText, CoreGui, true)
+	end
+	if parentTarget ~= CoreGui and not parentTarget:IsDescendantOf(CoreGui) then
+		task.spawn(watchGameText, parentTarget, true)
+	end
+	if not APPLY_2006_FONT_TO_GAME_GUIS then
+		task.spawn(watchGameText, LocalPlayer:WaitForChild("PlayerGui"), true)
+	end
+	-- overhead GUIs that scripts put on the characters themselves (like a health bar ESP)
+	local function watchCharacter(character)
+		task.spawn(watchGameText, character, true)
+	end
+	local function watchPlayer(player)
+		if player.Character then
+			watchCharacter(player.Character)
+		end
+		storeConnection(player.CharacterAdded:Connect(watchCharacter))
+	end
+	for _, player in ipairs(Players:GetPlayers()) do
+		watchPlayer(player)
+	end
+	storeConnection(Players.PlayerAdded:Connect(watchPlayer))
 end
 
 --========================================================
