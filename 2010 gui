@@ -1498,9 +1498,9 @@ updatePlayerList()
 -- 2006 style, sized off RetroStudio on a phone: a thin green bar with "Health" in
 -- blue in the 2006 font right under it, standing over the camera buttons in the
 -- bottom-right corner (36 from the edge lines it up with their middle).
--- How far up the bottom of "Health" sits: just over the camera buttons (their top is
--- 100 up), or higher on touch screens so it stays clear of Roblox's jump button.
-local HEALTH_LABEL_BOTTOM = UserInputService.TouchEnabled and 150 or 106
+-- How far up the bottom of "Health" sits: hovering over the camera buttons (their top
+-- is 100 up), high enough to stay clear of Roblox's jump button on phones.
+local HEALTH_LABEL_BOTTOM = 150
 local HEALTH_GREEN =
 	Color3.new(
 		0.5058824,
