@@ -10,16 +10,28 @@
 -- Chat bubbles over players' heads. 2006 Roblox had none, so they're off;
 -- chat still shows in the top-left corner.
 local SHOW_CHAT_BUBBLES = false
+-- NPC dialog bubbles (the "?", "!" and "$" you click over an NPC to talk to it). 2006 Roblox
+-- had none, so they're hidden, which also means NPC conversations can't be started.
+local SHOW_DIALOG_BUBBLES = false
+-- Names and health bars over characters and NPCs in the 2006 font. Roblox's own can't change
+-- font, so they're hidden and drawn again by this script.
+local USE_2006_NAME_TAGS = true
 -- Also switch the game's own on-screen text (PlayerGui) to the 2006 font. Text boxes are never touched.
 local APPLY_2006_FONT_TO_GAME_GUIS = true
 -- Also switch other executor scripts' text to the 2006 font: the Bloxy Paradox loader's NPC
--- dialog box, notices and dialog bubbles, and anything drawn over heads (health bar ESPs,
--- name tags). Executor menus are left alone, so their code editors keep their own fonts.
+-- dialog box, notices and dialog bubbles, and anything drawn over characters and NPCs (health
+-- bar ESPs, name tags). Executor menus are left alone, so their code editors keep their own fonts.
 local APPLY_2006_FONT_TO_OTHER_SCRIPTS = true
--- Also switch signs and name tags in the world (BillboardGui / SurfaceGui) to the 2006 font.
+-- Also switch every other sign and label in the world (BillboardGui / SurfaceGui) to the 2006 font.
 local APPLY_2006_FONT_TO_WORLD_TEXT = false
 -- Also switch Roblox's own menus and pop-ups (CoreGui) to the 2006 font.
 local APPLY_2006_FONT_TO_ROBLOX_MENUS = false
+-- Lighting, set when the script starts. Ambient and ColorShift_Bottom are put back whenever
+-- the game changes them; Brightness is only set once. false leaves the game's lighting alone.
+local SET_LIGHTING = true
+local LIGHTING_AMBIENT = Color3.fromRGB(181, 181, 181)
+local LIGHTING_COLOR_SHIFT_BOTTOM = Color3.fromRGB(122, 155, 128)
+local LIGHTING_BRIGHTNESS = 1.5
 --========================================================
 -- CLEANUP
 --========================================================
@@ -135,6 +147,26 @@ pcall(function()
 	CoreGui.TopBarApp.TopBarApp.Enabled = false
 end)
 --========================================================
+-- LIGHTING
+--========================================================
+if SET_LIGHTING then
+	pcall(function()
+		local Lighting = game:GetService("Lighting")
+		-- Sets a Lighting property and puts it back whenever the game changes it
+		local function lockLighting(property, value)
+			Lighting[property] = value
+			storeConnection(Lighting:GetPropertyChangedSignal(property):Connect(function()
+				if Lighting[property] ~= value then
+					Lighting[property] = value
+				end
+			end))
+		end
+		lockLighting("Ambient", LIGHTING_AMBIENT)
+		lockLighting("ColorShift_Bottom", LIGHTING_COLOR_SHIFT_BOTTOM)
+		Lighting.Brightness = LIGHTING_BRIGHTNESS
+	end)
+end
+--========================================================
 -- UI PARENT
 --========================================================
 local parentTarget = CoreGui
@@ -162,6 +194,79 @@ for _, container in ipairs({ parentTarget, LocalPlayer:FindFirstChildOfClass("Pl
 			end
 		end
 	end)
+end
+--========================================================
+-- NO DIALOG BUBBLES
+--========================================================
+-- The bubbles over NPCs are BillboardGuis: Roblox's own (in CoreGui) and the classic ones
+-- the Bloxy Paradox loader draws instead. They're switched off and kept off.
+local DIALOG_BUBBLE_MARKER = "Classic2006HiddenBubble"
+local hiddenDialogBubbles = setmetatable({}, { __mode = "k" })
+
+local function isDialogBubble(gui)
+	local name = gui.Name
+	if name == "ChatNotificationGui"
+		or name == "PlayerDialogBubble"
+		or string.find(name, "^ClassicExecutorDialogGui_") then
+		return true
+	end
+	-- Roblox's bubble under some other name still has its dialog bubble pictures
+	for _, child in ipairs(gui:GetDescendants()) do
+		if child:IsA("ImageLabel") or child:IsA("ImageButton") then
+			local image = string.lower(child.Image)
+			if string.find(image, "dialog_purpose", 1, true) or string.find(image, "notify_bkg", 1, true) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function hideDialogBubble(gui)
+	if hiddenDialogBubbles[gui] or not isDialogBubble(gui) then
+		return
+	end
+	hiddenDialogBubbles[gui] = true
+	-- lets a later run with SHOW_DIALOG_BUBBLES on find it again
+	pcall(gui.SetAttribute, gui, DIALOG_BUBBLE_MARKER, true)
+	gui.Enabled = false
+	storeConnection(gui:GetPropertyChangedSignal("Enabled"):Connect(function()
+		if gui.Enabled then
+			gui.Enabled = false
+		end
+	end))
+end
+
+-- Brings back a bubble an earlier run of this script switched off
+local function showDialogBubble(gui)
+	if gui:GetAttribute(DIALOG_BUBBLE_MARKER) then
+		gui:SetAttribute(DIALOG_BUBBLE_MARKER, nil)
+		gui.Enabled = true
+	end
+end
+
+local function watchDialogBubbles(root)
+	if not SHOW_DIALOG_BUBBLES then
+		storeConnection(root.DescendantAdded:Connect(function(obj)
+			if obj:IsA("BillboardGui") then
+				-- wait a moment so the bubble is set up first
+				task.defer(pcall, hideDialogBubble, obj)
+			end
+		end))
+	end
+	for _, obj in ipairs(root:GetDescendants()) do
+		if obj:IsA("BillboardGui") then
+			pcall(SHOW_DIALOG_BUBBLES and showDialogBubble or hideDialogBubble, obj)
+		end
+	end
+end
+
+local dialogBubbleRoots = { CoreGui, LocalPlayer:WaitForChild("PlayerGui") }
+if parentTarget ~= CoreGui and not parentTarget:IsDescendantOf(CoreGui) then
+	table.insert(dialogBubbleRoots, parentTarget)
+end
+for _, root in ipairs(dialogBubbleRoots) do
+	task.spawn(pcall, watchDialogBubbles, root)
 end
 --========================================================
 -- 2006 FONT
@@ -331,7 +436,27 @@ local function render2006(state)
 		or label.RichText
 		or #text > MAX_BITMAP_CHARACTERS
 		or string.find(text, "[\128-\255]") then
+		state.layoutKey = nil
+		state.scaledAspect = nil
 		show2006Fallback(state)
+		return
+	end
+	local wrapWidth = state.wrapWidth
+	local size = label.TextSize + 4
+	local available = nil
+	if label.TextScaled or (label.TextWrapped and not wrapWidth) then
+		available = label.AbsoluteSize / getCumulativeScale(label)
+		if label.TextWrapped then
+			wrapWidth = wrapWidth or available.X
+		end
+		if label.TextScaled then
+			size = getScaledSize(text, label, wrapWidth or available.X, available.Y)
+		end
+	end
+	local lines = layout2006Lines(text, size, wrapWidth)
+	-- Only the label's size changed and the letters would come out the same: nothing to redo
+	local layoutKey = size .. "\n" .. table.concat(lines, "\n")
+	if layoutKey == state.layoutKey and state.content and state.content.Parent == label then
 		return
 	end
 	label.TextTransparency = HIDDEN
@@ -352,18 +477,6 @@ local function render2006(state)
 	end
 	content.Visible = true
 
-	local wrapWidth = state.wrapWidth
-	local size = label.TextSize + 4
-	if label.TextScaled or (label.TextWrapped and not wrapWidth) then
-		local available = label.AbsoluteSize / getCumulativeScale(label)
-		if label.TextWrapped then
-			wrapWidth = wrapWidth or available.X
-		end
-		if label.TextScaled then
-			size = getScaledSize(text, label, wrapWidth or available.X, available.Y)
-		end
-	end
-	local lines = layout2006Lines(text, size, wrapWidth)
 	local lineAdvance = size * label.LineHeight
 	local lineWidths = {}
 	local blockWidth = 0
@@ -383,9 +496,23 @@ local function render2006(state)
 	elseif label.TextYAlignment == Enum.TextYAlignment.Bottom then
 		alignY = 1
 	end
+	local blockHeight = (#lines - 1) * lineAdvance + size
+	-- TextScaled letters are placed in fractions of the label, so when the label grows or
+	-- shrinks (a BillboardGui as the camera moves) they follow it without being drawn again
+	local relative = label.TextScaled and available ~= nil and available.X > 0 and available.Y > 0 and blockWidth > 0
+	local function place(x, y, offsetX, offsetY)
+		if relative then
+			return UDim2.new(x / blockWidth, offsetX, y / blockHeight, offsetY)
+		end
+		return UDim2.fromOffset(x + offsetX, y + offsetY)
+	end
 	content.AnchorPoint = Vector2.new(alignX, alignY)
 	content.Position = UDim2.new(alignX, 0, alignY, 0)
-	content.Size = UDim2.fromOffset(blockWidth, (#lines - 1) * lineAdvance + size)
+	if relative then
+		content.Size = UDim2.fromScale(blockWidth / available.X, blockHeight / available.Y)
+	else
+		content.Size = UDim2.fromOffset(blockWidth, blockHeight)
+	end
 
 	local textColor = label.TextColor3
 	local strokeColor = label.TextStrokeColor3
@@ -418,8 +545,8 @@ local function render2006(state)
 				local glyph = getPooledImage(state.glyphs, glyphCount, content, "Glyph")
 				glyph.ImageRectOffset = rectOffset
 				glyph.ImageRectSize = rectSize
-				glyph.Size = UDim2.fromOffset(pixelWidth, size)
-				glyph.Position = UDim2.fromOffset(x, y)
+				glyph.Size = place(pixelWidth, size, 0, 0)
+				glyph.Position = place(x, y, 0, 0)
 				if state.prefixLength and characterCount <= state.prefixLength then
 					glyph.ImageColor3 = state.prefixColor
 				else
@@ -434,7 +561,7 @@ local function render2006(state)
 						outline.ImageRectOffset = rectOffset
 						outline.ImageRectSize = rectSize
 						outline.Size = glyph.Size
-						outline.Position = UDim2.fromOffset(x + shift.X, y + shift.Y)
+						outline.Position = place(x, y, shift.X, shift.Y)
 						outline.ImageColor3 = strokeColor
 						outline.ImageTransparency = outlineTransparency
 						outline.ZIndex = label.ZIndex + 1
@@ -452,15 +579,24 @@ local function render2006(state)
 	for i = outlineCount + 1, #state.outlines do
 		state.outlines[i].Visible = false
 	end
+	state.scaledAspect = relative and available.X / available.Y or nil
+	-- (letters placed in fractions follow the label by themselves, see the AbsoluteSize handler)
+	state.layoutKey = not relative and layoutKey or nil
 end
 
 local function safeRender2006(state)
 	if not pcall(render2006, state) then
+		state.layoutKey = nil
+		state.scaledAspect = nil
 		pcall(show2006Fallback, state)
 	end
 end
 
-local function queue2006Render(state)
+-- sizeOnly: only the label's size changed, so a render that would come out the same is skipped
+local function queue2006Render(state, sizeOnly)
+	if not sizeOnly then
+		state.layoutKey = nil
+	end
 	if state.queued then
 		return
 	end
@@ -533,9 +669,18 @@ local function apply2006Font(label, opts)
 		end
 	end)
 	label:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
-		if label.TextScaled or (label.TextWrapped and not state.wrapWidth) then
-			queue2006Render(state)
+		if not (label.TextScaled or (label.TextWrapped and not state.wrapWidth)) then
+			return
 		end
+		-- Letters placed in fractions of the label already followed it: only a change of shape
+		-- needs them drawn again
+		local aspect = state.scaledAspect
+		local absoluteSize = label.AbsoluteSize
+		if aspect and label.TextScaled and absoluteSize.Y > 0
+			and math.abs(absoluteSize.X / absoluteSize.Y / aspect - 1) < 0.005 then
+			return
+		end
+		queue2006Render(state, true)
 	end)
 	safeRender2006(state)
 end
@@ -1594,6 +1739,434 @@ storeConnection(
 	)
 )
 --========================================================
+-- 2006 NAMES AND HEALTH BARS OVER HEADS
+--========================================================
+-- Roblox draws the names and health bars over characters and NPCs itself, in a font that
+-- can't be changed. So Roblox's are hidden and drawn again here: the name in white in the
+-- 2006 font with the health bar (green over red) under it, the same size at any distance.
+-- They follow Roblox's rules: DisplayDistanceType, HealthDisplayType (by default the bar only
+-- shows once hurt) and the name and health display distances.
+-- Roblox's are hidden by holding the display distances that decide them at 0: this player's
+-- character's (they decide what this player sees) and those of humanoids set to "Subject"
+-- (those decide for themselves). The game's values are saved in attributes, so they still
+-- count, even after running this script again.
+local NAME_TAG_TEXT_SIZE = 16
+local NAME_TAG_BAR_WIDTH = 60
+local NAME_TAG_BAR_HEIGHT = 7
+local MAX_NAME_TAGS = 40
+local DISPLAY_DISTANCES = { "NameDisplayDistance", "HealthDisplayDistance" }
+
+local function disconnectAll(connections)
+	for _, conn in ipairs(connections) do
+		conn:Disconnect()
+	end
+end
+
+-- The display distance the game wants (saved in an attribute while it's held at 0)
+local function getGameDistance(humanoid, property)
+	local saved = humanoid:GetAttribute("Classic2006" .. property)
+	if type(saved) == "number" then
+		return saved
+	end
+	return humanoid[property]
+end
+
+-- Holds a humanoid's name and health display distances at 0, saving the game's values (and
+-- any it sets later). Returns the connections doing the holding.
+local function holdDisplayDistances(humanoid)
+	local connections = {}
+	for _, property in ipairs(DISPLAY_DISTANCES) do
+		local attribute = "Classic2006" .. property
+		local function hold()
+			local value = humanoid[property]
+			if value ~= 0 or humanoid:GetAttribute(attribute) == nil then
+				humanoid:SetAttribute(attribute, value)
+			end
+			if value ~= 0 then
+				humanoid[property] = 0
+			end
+		end
+		hold()
+		table.insert(connections, humanoid:GetPropertyChangedSignal(property):Connect(hold))
+	end
+	return connections
+end
+
+-- Puts back the display distances holdDisplayDistances saved
+local function releaseDisplayDistances(humanoid)
+	for _, property in ipairs(DISPLAY_DISTANCES) do
+		local attribute = "Classic2006" .. property
+		local saved = humanoid:GetAttribute(attribute)
+		if type(saved) == "number" then
+			humanoid:SetAttribute(attribute, nil)
+			humanoid[property] = saved
+		end
+	end
+end
+
+if USE_2006_NAME_TAGS then
+	-- Name tags left behind by an earlier run of this script
+	for _, container in ipairs({ CoreGui, LocalPlayer:FindFirstChildOfClass("PlayerGui") }) do
+		pcall(function()
+			local old = container:FindFirstChild("Classic2006NameTags")
+			if old then
+				old:Destroy()
+			end
+		end)
+	end
+	local NameTagFolder = Instance.new("Folder")
+	NameTagFolder.Name = "Classic2006NameTags"
+	if not pcall(function()
+		NameTagFolder.Parent = CoreGui
+	end) then
+		NameTagFolder.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	end
+	local nameTags = {}
+	local nameTagsRunning = true
+	local viewerHumanoid = nil
+	local viewerHold = {}
+
+	local function getTagName(tag)
+		local displayName = tag.humanoid.DisplayName
+		if displayName ~= "" then
+			return displayName
+		end
+		return tag.model.Name
+	end
+
+	-- The BillboardGui is centred on a spot just above the head and the tag fills its top
+	-- half, so the tag stands on that spot. Sized with the same scale as the rest of the GUI.
+	local function layoutNameTag(tag)
+		local scale = getClassicUIScale()
+		local textSize = scaleTextSize(NAME_TAG_TEXT_SIZE, scale)
+		local nameHeight = textSize + 4
+		local barWidth = NAME_TAG_BAR_WIDTH * scale
+		local barHeight = NAME_TAG_BAR_HEIGHT * scale
+		local height = nameHeight + scale + barHeight
+		local width = math.max(get2006TextWidth(tag.name, textSize), barWidth) + 8 * scale
+		tag.scale = scale
+		tag.gui.Size = UDim2.fromOffset(width, height * 2)
+		tag.nameLabel.Size = UDim2.new(1, 0, 0, nameHeight)
+		tag.nameLabel.TextSize = textSize
+		tag.barBack.Position = UDim2.new(0.5, 0, 0, height - barHeight)
+		tag.barBack.Size = UDim2.fromOffset(barWidth, barHeight)
+	end
+
+	local function buildNameTag(tag)
+		local gui = Instance.new("BillboardGui")
+		gui.Name = "NameTag"
+		gui.AlwaysOnTop = true
+		gui.LightInfluence = 0
+		gui.ResetOnSpawn = false
+		-- half a stud over the top of the head
+		gui.ExtentsOffsetWorldSpace = Vector3.new(0, 1, 0)
+		gui.StudsOffsetWorldSpace = Vector3.new(0, 0.5, 0)
+		-- The Bloxy Paradox loader switches off billboards over the NPCs it gives dialogs, unless
+		-- they carry its own mark
+		gui:SetAttribute("ClassicOwned", true)
+		local nameLabel = Instance.new("TextLabel")
+		nameLabel.Name = "NameLabel"
+		nameLabel.BackgroundTransparency = 1
+		nameLabel.Text = tag.name
+		nameLabel.TextColor3 = Color3.new(1, 1, 1)
+		nameLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
+		nameLabel.TextStrokeTransparency = 0
+		nameLabel.Parent = gui
+		local barBack = Instance.new("Frame")
+		barBack.Name = "HealthBar"
+		barBack.AnchorPoint = Vector2.new(0.5, 0)
+		barBack.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+		barBack.BorderSizePixel = 0
+		barBack.Parent = gui
+		local barFill = Instance.new("Frame")
+		barFill.Name = "Fill"
+		barFill.BackgroundColor3 = HEALTH_GREEN
+		barFill.BorderSizePixel = 0
+		barFill.Parent = barBack
+		tag.gui = gui
+		tag.nameLabel = nameLabel
+		tag.barBack = barBack
+		tag.barFill = barFill
+		layoutNameTag(tag)
+		apply2006Font(nameLabel)
+		gui.Parent = NameTagFolder
+	end
+
+	-- keep: only switch it off, for when it's wanted again soon
+	local function hideNameTag(tag, keep)
+		if tag.gui then
+			if keep then
+				tag.gui.Enabled = false
+			else
+				tag.gui:Destroy()
+				tag.gui = nil
+			end
+		end
+	end
+
+	-- Something else already shows this name over the character (a health bar ESP, or the game's
+	-- own name tag, both in the 2006 font as well), so it isn't shown twice. Checked every 2 seconds.
+	local function hasOtherNameTag(tag)
+		local now = os.clock()
+		if tag.otherNameCheckedAt and now - tag.otherNameCheckedAt < 2 then
+			return tag.otherName
+		end
+		tag.otherNameCheckedAt = now
+		tag.otherName = false
+		if tag.name == "" then
+			return false
+		end
+		for _, obj in ipairs(tag.model:GetDescendants()) do
+			if (obj:IsA("TextLabel") or obj:IsA("TextButton"))
+				and string.find(obj.Text, tag.name, 1, true)
+				and obj:FindFirstAncestorWhichIsA("BillboardGui") then
+				tag.otherName = true
+				break
+			end
+		end
+		return tag.otherName
+	end
+
+	-- What a tag should show by Roblox's rules, or nil when it shows nothing at all
+	local function getNameTagView(tag)
+		local humanoid = tag.humanoid
+		local head = tag.model:FindFirstChild("Head")
+		local camera = Workspace.CurrentCamera
+		local displayType = humanoid.DisplayDistanceType
+		if not (head and head:IsA("BasePart") and camera)
+			or displayType == Enum.HumanoidDisplayDistanceType.None
+			or tag.model == LocalPlayer.Character
+			or hasOtherNameTag(tag) then
+			return nil
+		end
+		-- "Viewer": as far as this player's character is set to see; "Subject": as far as the humanoid is set to show
+		local source = humanoid
+		if displayType == Enum.HumanoidDisplayDistanceType.Viewer then
+			source = viewerHumanoid
+		end
+		local nameDistance, healthDistance = 100, 100
+		if source then
+			nameDistance = getGameDistance(source, "NameDisplayDistance")
+			healthDistance = getGameDistance(source, "HealthDisplayDistance")
+		end
+		local distance = (camera.CFrame.Position - head.Position).Magnitude
+		local healthType = humanoid.HealthDisplayType
+		return {
+			head = head,
+			distance = distance,
+			range = math.max(nameDistance, healthDistance),
+			showName = distance <= nameDistance,
+			showHealth = distance <= healthDistance
+				and (healthType == Enum.HumanoidHealthDisplayType.AlwaysOn
+					or (healthType == Enum.HumanoidHealthDisplayType.DisplayWhenDamaged
+						and humanoid.Health < humanoid.MaxHealth))
+		}
+	end
+
+	local function showNameTag(tag, view)
+		if not tag.gui then
+			buildNameTag(tag)
+		elseif tag.scale ~= getClassicUIScale() then
+			layoutNameTag(tag)
+		end
+		local humanoid = tag.humanoid
+		local fraction = 1
+		if humanoid.MaxHealth > 0 then
+			fraction = humanoid.Health / humanoid.MaxHealth
+		end
+		if fraction ~= fraction then
+			-- infinite health
+			fraction = 1
+		end
+		tag.gui.Adornee = view.head
+		tag.nameLabel.Visible = view.showName
+		tag.barBack.Visible = view.showHealth
+		tag.barFill.Size = UDim2.fromScale(math.clamp(fraction, 0, 1), 1)
+		tag.gui.Enabled = true
+	end
+
+	-- Brings a tag that's showing up to date right away (its health or settings changed);
+	-- the loop at the bottom takes care of the rest
+	local function updateNameTag(tag)
+		if not (tag.gui and tag.gui.Enabled) then
+			return
+		end
+		local view = getNameTagView(tag)
+		if view and (view.showName or view.showHealth) then
+			showNameTag(tag, view)
+		else
+			hideNameTag(tag, view ~= nil)
+		end
+	end
+
+	local function renameNameTag(tag)
+		local name = getTagName(tag)
+		if name ~= tag.name then
+			tag.name = name
+			if tag.gui then
+				tag.nameLabel.Text = name
+				layoutNameTag(tag)
+			end
+		end
+	end
+
+	-- A humanoid set to "Subject" decides with its own display distances, so those are held at 0 too
+	local function updateSubjectHold(tag)
+		local isSubject = tag.humanoid.DisplayDistanceType == Enum.HumanoidDisplayDistanceType.Subject
+		if isSubject and not tag.hold then
+			tag.hold = holdDisplayDistances(tag.humanoid)
+		elseif not isSubject then
+			if tag.hold then
+				disconnectAll(tag.hold)
+				tag.hold = nil
+			end
+			releaseDisplayDistances(tag.humanoid)
+		end
+	end
+
+	-- giveBack puts the humanoid's own display distances back (not done for the next run of this script)
+	local function untrackHumanoid(humanoid, giveBack)
+		local tag = nameTags[humanoid]
+		if not tag then
+			return
+		end
+		nameTags[humanoid] = nil
+		disconnectAll(tag.connections)
+		if tag.hold then
+			disconnectAll(tag.hold)
+			tag.hold = nil
+			if giveBack then
+				pcall(releaseDisplayDistances, humanoid)
+			end
+		end
+		hideNameTag(tag, false)
+	end
+
+	local function trackHumanoid(humanoid)
+		if nameTags[humanoid] or not nameTagsRunning or not humanoid:IsDescendantOf(Workspace) then
+			return
+		end
+		local model = humanoid.Parent
+		if not (model and model:IsA("Model")) or model == LocalPlayer.Character then
+			return
+		end
+		local tag = { humanoid = humanoid, model = model, connections = {} }
+		tag.name = getTagName(tag)
+		nameTags[humanoid] = tag
+		local function update()
+			pcall(updateNameTag, tag)
+		end
+		local function rename()
+			pcall(renameNameTag, tag)
+		end
+		tag.connections = {
+			humanoid.HealthChanged:Connect(update),
+			humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(update),
+			humanoid:GetPropertyChangedSignal("HealthDisplayType"):Connect(update),
+			humanoid:GetPropertyChangedSignal("DisplayDistanceType"):Connect(function()
+				pcall(updateSubjectHold, tag)
+				update()
+			end),
+			humanoid:GetPropertyChangedSignal("DisplayName"):Connect(rename),
+			model:GetPropertyChangedSignal("Name"):Connect(rename),
+			humanoid.AncestryChanged:Connect(function()
+				if humanoid.Parent ~= model or not humanoid:IsDescendantOf(Workspace) then
+					untrackHumanoid(humanoid, true)
+					-- moved into another model: start again with that one
+					task.defer(pcall, trackHumanoid, humanoid)
+				end
+			end)
+		}
+		updateSubjectHold(tag)
+	end
+
+	-- This player's own character gets no tag, and its display distances (which decide what this
+	-- player sees of the other characters) are held at 0
+	local function holdViewer(character)
+		local humanoid = character:FindFirstChildOfClass("Humanoid") or character:WaitForChild("Humanoid", 10)
+		if not humanoid or not nameTagsRunning or LocalPlayer.Character ~= character then
+			return
+		end
+		untrackHumanoid(humanoid, false)
+		disconnectAll(viewerHold)
+		viewerHumanoid = humanoid
+		viewerHold = holdDisplayDistances(humanoid)
+	end
+
+	-- Running this script again stops this run; the held distances stay saved for the new one
+	storeConnection({
+		Disconnect = function()
+			nameTagsRunning = false
+			for humanoid in pairs(nameTags) do
+				untrackHumanoid(humanoid, false)
+			end
+			disconnectAll(viewerHold)
+			NameTagFolder:Destroy()
+		end
+	})
+	if LocalPlayer.Character then
+		task.spawn(pcall, holdViewer, LocalPlayer.Character)
+	end
+	storeConnection(LocalPlayer.CharacterAdded:Connect(function(character)
+		pcall(holdViewer, character)
+	end))
+	storeConnection(Workspace.DescendantAdded:Connect(function(obj)
+		if obj:IsA("Humanoid") then
+			task.defer(pcall, trackHumanoid, obj)
+		end
+	end))
+	task.spawn(function()
+		for index, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("Humanoid") then
+				pcall(trackHumanoid, obj)
+			end
+			if index % 500 == 0 then
+				task.wait()
+			end
+		end
+	end)
+	-- Distances change as everything moves, so the tags are sorted out a few times a second.
+	-- Only the nearest MAX_NAME_TAGS show, so a crowd of NPCs can't flood the screen (or slow the game).
+	task.spawn(function()
+		while nameTagsRunning do
+			local views = {}
+			for _, tag in pairs(nameTags) do
+				local ok, view = pcall(getNameTagView, tag)
+				if ok and view and (view.showName or view.showHealth) then
+					view.tag = tag
+					table.insert(views, view)
+				else
+					-- out of range: kept for when it comes back, unless it's well out of range
+					pcall(hideNameTag, tag, ok and view ~= nil and view.distance <= view.range + 25)
+				end
+			end
+			table.sort(views, function(a, b)
+				return a.distance < b.distance
+			end)
+			for index, view in ipairs(views) do
+				if index <= MAX_NAME_TAGS then
+					pcall(showNameTag, view.tag, view)
+				else
+					pcall(hideNameTag, view.tag, index <= MAX_NAME_TAGS + 10)
+				end
+			end
+			task.wait(0.2)
+		end
+	end)
+else
+	-- An earlier run of this script may have hidden Roblox's own names: give them back
+	task.spawn(function()
+		for index, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("Humanoid") then
+				pcall(releaseDisplayDistances, obj)
+			end
+			if index % 500 == 0 then
+				task.wait()
+			end
+		end
+	end)
+end
+--========================================================
 -- CHAT SYSTEM
 --========================================================
 local ChatContainer =
@@ -2638,11 +3211,32 @@ local function isOtherScriptText(obj)
 	return false
 end
 
-local function convertGameText(obj, onlyOtherScriptText)
+-- A BillboardGui over a character or NPC: inside its model, or shown on one of its parts
+local function isOverCharacter(billboard)
+	for _, start in ipairs({ billboard, billboard.Adornee }) do
+		local model = start.ClassName == "Model" and start or start:FindFirstAncestorOfClass("Model")
+		while model do
+			if model:FindFirstChildOfClass("Humanoid") then
+				return true
+			end
+			model = model:FindFirstAncestorOfClass("Model")
+		end
+	end
+	return false
+end
+
+-- Text in the world that's drawn over a character or NPC (names and health bars over heads)
+local function isOverheadText(obj)
+	local billboard = obj:FindFirstAncestorWhichIsA("BillboardGui")
+	return billboard ~= nil and isOverCharacter(billboard)
+end
+
+-- filter: when given, only text it says yes to is restyled
+local function convertGameText(obj, filter)
 	if fontStates[obj] or obj:GetAttribute("Classic2006Font") or obj:IsDescendantOf(ScreenGui) then
 		return
 	end
-	if onlyOtherScriptText and not isOtherScriptText(obj) then
+	if filter and not filter(obj) then
 		return
 	end
 	-- Leave other executor GUIs alone (they share the hidden gethui() folder with this one)
@@ -2675,18 +3269,18 @@ local function isGameText(obj)
 	return obj:IsA("TextLabel") or obj:IsA("TextButton")
 end
 
-local function watchGameText(root, onlyOtherScriptText)
+local function watchGameText(root, filter)
 	storeConnection(
 		root.DescendantAdded:Connect(function(obj)
 			if isGameText(obj) then
 				-- wait a moment so the game finishes setting the text up first
-				task.defer(pcall, convertGameText, obj, onlyOtherScriptText)
+				task.defer(pcall, convertGameText, obj, filter)
 			end
 		end)
 	)
 	for index, obj in ipairs(root:GetDescendants()) do
 		if isGameText(obj) then
-			pcall(convertGameText, obj, onlyOtherScriptText)
+			pcall(convertGameText, obj, filter)
 		end
 		-- a big GUI is taken over a bit at a time instead of freezing the game
 		if index % 200 == 0 then
@@ -2706,28 +3300,18 @@ if APPLY_2006_FONT_TO_ROBLOX_MENUS then
 end
 if APPLY_2006_FONT_TO_OTHER_SCRIPTS then
 	if not APPLY_2006_FONT_TO_ROBLOX_MENUS then
-		task.spawn(watchGameText, CoreGui, true)
+		task.spawn(watchGameText, CoreGui, isOtherScriptText)
 	end
 	if parentTarget ~= CoreGui and not parentTarget:IsDescendantOf(CoreGui) then
-		task.spawn(watchGameText, parentTarget, true)
+		task.spawn(watchGameText, parentTarget, isOtherScriptText)
 	end
 	if not APPLY_2006_FONT_TO_GAME_GUIS then
-		task.spawn(watchGameText, LocalPlayer:WaitForChild("PlayerGui"), true)
+		task.spawn(watchGameText, LocalPlayer:WaitForChild("PlayerGui"), isOtherScriptText)
 	end
-	-- overhead GUIs that scripts put on the characters themselves (like a health bar ESP)
-	local function watchCharacter(character)
-		task.spawn(watchGameText, character, true)
+	-- overhead GUIs put on the characters and NPCs themselves (like a health bar ESP)
+	if not APPLY_2006_FONT_TO_WORLD_TEXT then
+		task.spawn(watchGameText, Workspace, isOverheadText)
 	end
-	local function watchPlayer(player)
-		if player.Character then
-			watchCharacter(player.Character)
-		end
-		storeConnection(player.CharacterAdded:Connect(watchCharacter))
-	end
-	for _, player in ipairs(Players:GetPlayers()) do
-		watchPlayer(player)
-	end
-	storeConnection(Players.PlayerAdded:Connect(watchPlayer))
 end
 
 --========================================================
