@@ -7,13 +7,12 @@
 --========================================================
 -- SETTINGS
 --========================================================
--- In RetroStudio, draw this GUI with the game's own 2006 bitmap font.
--- If that text ever looks wrong, set this to false to use the built-in 2006 look instead.
-local USE_GAME_2006_FONT = true
 -- Also switch the game's own on-screen text (PlayerGui) to the 2006 font. Text boxes are never touched.
 local APPLY_2006_FONT_TO_GAME_GUIS = true
 -- Also switch signs and name tags in the world (BillboardGui / SurfaceGui) to the 2006 font.
 local APPLY_2006_FONT_TO_WORLD_TEXT = false
+-- Also switch Roblox's own menus and pop-ups (CoreGui) to the 2006 font.
+local APPLY_2006_FONT_TO_ROBLOX_MENUS = false
 --========================================================
 -- CLEANUP
 --========================================================
@@ -40,7 +39,6 @@ local Teams = game:GetService("Teams")
 local StarterGui = game:GetService("StarterGui")
 local TextChatService = game:GetService("TextChatService")
 local UserInputService = game:GetService("UserInputService")
-local TextService = game:GetService("TextService")
 local Workspace = game:GetService("Workspace")
 local CoreGui = game:GetService("CoreGui")
 local LocalPlayer = Players.LocalPlayer
@@ -151,129 +149,399 @@ end
 --========================================================
 -- 2006 FONT
 --========================================================
--- The 2006 client drew its GUI text with a bitmap copy of Eras Demi ITC,
--- which Roblox doesn't ship. Text is drawn one of two ways:
---  * In RetroStudio, the game's own 2006 renderer (ReplicatedStorage.Modules.CustomFont)
---    draws our labels, called the same way the game's ClientLocalPlayerScripts calls it.
---  * Everywhere else, Nunito ExtraBold Italic: the closest built-in font to Eras Demi.
-local FONT_2006 = Font.new(
+-- RetroStudio's 2006 bitmap font renderer (ReplicatedStorage.Modules.CustomFont),
+-- built into this script so it works in any game. Every letter is cut out of one
+-- font sheet (ASCII codes in a 16-wide grid of 32x32 cells) and drawn at its own
+-- width from GLYPH_WIDTHS. A label keeps its Text: its own text is hidden and the
+-- letters are drawn over it as ImageLabels inside a "TextContent" frame.
+-- When the font sheet can't load, or a label needs something the bitmap font can't
+-- draw (rich text, non-English letters or emoji, very long text), the label uses
+-- FALLBACK_FONT instead: Nunito ExtraBold Italic, the closest built-in Roblox font.
+local FONT_SHEET = "rbxassetid://11363842965"
+local GLYPH_WIDTHS = {}
+for code, hex in ipairs({
+	"1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "60", "1A", "1A", "00", "1A", "1A", "1A", -- 1-16
+	"1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "1A", "07", -- 17-32
+	"08", "09", "10", "10", "16", "13", "05", "09", "09", "0D", "10", "07", "07", "07", "0B", "10", -- 33-48
+	"10", "10", "10", "10", "10", "10", "10", "10", "10", "07", "07", "0D", "10", "0D", "0D", "16", -- 49-64
+	"14", "11", "11", "14", "10", "0F", "14", "14", "08", "0C", "11", "0E", "17", "14", "16", "0F", -- 65-80
+	"16", "10", "0D", "0F", "14", "12", "1B", "11", "0F", "10", "09", "0B", "09", "0D", "0D", "0D", -- 81-96
+	"0F", "10", "0D", "10", "0F", "09", "10", "11", "07", "07", "0E", "07", "17", "11", "10", "10", -- 97-112
+	"10", "0A", "0B", "0A", "10", "0E", "17", "0E", "0E", "0D", "0B", "0D", "0B", "11", "1A" -- 113-127
+}) do
+	GLYPH_WIDTHS[code] = tonumber(hex, 16)
+end
+local OUTLINE_OFFSETS = {
+	Vector2.new(-1, -1),
+	Vector2.new(1, 1),
+	Vector2.new(1, -1),
+	Vector2.new(-1, 1)
+}
+local FALLBACK_FONT = Font.new(
 	"rbxasset://fonts/families/Nunito.json",
 	Enum.FontWeight.ExtraBold,
 	Enum.FontStyle.Italic
 )
--- RetroStudio marks the labels its renderer should draw with this family
-local GAME_FONT_MARKER = "rbxasset://fonts/families/GothamSSm.json"
-local GameFontModule = nil
-pcall(function()
-	local replicatedStorage = game:GetService("ReplicatedStorage")
-	local modules = replicatedStorage:FindFirstChild("Modules")
-	local module = modules and modules:FindFirstChild("CustomFont")
-	if module and module:IsA("ModuleScript")
-		and replicatedStorage:FindFirstChild("TimePeriod")
-		and replicatedStorage:FindFirstChild("Protocols") then
-		GameFontModule = module
+-- A label's own text is hidden at this transparency rather than 1, so a game fading
+-- its text all the way out can still be told apart from the renderer hiding it
+local HIDDEN = 0.9990234375
+local MAX_BITMAP_CHARACTERS = 300
+local fontSheetFailed = false
+local fontStates = setmetatable({}, { __mode = "k" })
+
+-- Font sheet code for a byte; characters the font doesn't have use glyph 1 (a box)
+local function glyphCode(byte)
+	if GLYPH_WIDTHS[byte] then
+		return byte
+	end
+	return 1
+end
+
+-- Width of one line of text, in pixels, with letters `size` pixels tall
+local function measure2006Line(line, size)
+	local width = 0
+	for i = 1, #line do
+		width += GLYPH_WIDTHS[glyphCode(string.byte(line, i))]
+	end
+	return width / 32 * size
+end
+
+-- Splits text into lines on "\n", word-wrapping each one at maxWidth when given
+local function layout2006Lines(text, size, maxWidth)
+	local lines = {}
+	for _, paragraph in ipairs(string.split(text, "\n")) do
+		local current = nil
+		for _, word in ipairs(string.split(paragraph, " ")) do
+			if current == nil then
+				current = word
+			elseif maxWidth and measure2006Line(current .. " " .. word, size) > maxWidth then
+				table.insert(lines, current)
+				current = word
+			else
+				current = current .. " " .. word
+			end
+		end
+		table.insert(lines, current or "")
+	end
+	return lines
+end
+
+-- Letters are TextSize + 4 pixels tall, the same as RetroStudio (TextBounds.Y + 4)
+local function get2006TextWidth(text, textSize)
+	return measure2006Line(text, textSize + 4)
+end
+
+-- All the UIScales above a GUI object multiplied, to turn AbsoluteSize back into its own units
+local function getCumulativeScale(object)
+	local scale = 1
+	while object do
+		local uiScale = object:FindFirstChildOfClass("UIScale")
+		if uiScale then
+			scale *= uiScale.Scale
+		end
+		object = object.Parent
+	end
+	return math.max(scale, 0.001)
+end
+
+-- The biggest letters that still fit the label, like TextScaled does
+local function getScaledSize(text, label, maxWidth, maxHeight)
+	local lineHeight = label.LineHeight
+	if label.TextWrapped then
+		local low, high = 1, math.max(1, math.min(maxHeight, 104))
+		for _ = 1, 12 do
+			local size = (low + high) / 2
+			local lines = layout2006Lines(text, size, maxWidth)
+			local fits = (#lines - 1) * size * lineHeight + size <= maxHeight
+			for _, line in ipairs(lines) do
+				if fits and measure2006Line(line, size) > maxWidth then
+					fits = false
+				end
+			end
+			if fits then
+				low = size
+			else
+				high = size
+			end
+		end
+		return low
+	end
+	local lines = string.split(text, "\n")
+	local widest = 0
+	for _, line in ipairs(lines) do
+		widest = math.max(widest, measure2006Line(line, 1))
+	end
+	local size = maxHeight / ((#lines - 1) * lineHeight + 1)
+	if widest > 0 then
+		size = math.min(size, maxWidth / widest)
+	end
+	return math.clamp(size, 1, 104)
+end
+
+local function getPooledImage(pool, index, parent, name)
+	local image = pool[index]
+	if not image then
+		image = Instance.new("ImageLabel")
+		image.Name = name
+		image.BackgroundTransparency = 1
+		image.Image = FONT_SHEET
+		image.Parent = parent
+		pool[index] = image
+	end
+	image.Visible = true
+	return image
+end
+
+-- Shows the label's own text in the fallback font instead of the bitmap letters
+local function show2006Fallback(state)
+	local label = state.label
+	if state.content then
+		state.content.Visible = false
+	end
+	if state.uiStroke then
+		state.uiStroke.Enabled = true
+	end
+	label.FontFace = FALLBACK_FONT
+	label.TextTransparency = state.textTransparency
+	label.TextStrokeTransparency = state.strokeTransparency
+end
+
+local function render2006(state)
+	local label = state.label
+	local text = string.gsub(label.Text, "\r", "")
+	text = string.gsub(text, "\t", "    ")
+	if fontSheetFailed
+		or label.RichText
+		or #text > MAX_BITMAP_CHARACTERS
+		or string.find(text, "[\128-\255]") then
+		show2006Fallback(state)
+		return
+	end
+	label.TextTransparency = HIDDEN
+	label.TextStrokeTransparency = HIDDEN
+	if state.uiStroke then
+		state.uiStroke.Enabled = false
+	end
+	local content = state.content
+	if not content or content.Parent ~= label then
+		content = Instance.new("Frame")
+		content.Name = "TextContent"
+		content.BackgroundTransparency = 1
+		content:SetAttribute("CustomFont", true)
+		content.Parent = label
+		state.content = content
+		state.glyphs = {}
+		state.outlines = {}
+	end
+	content.Visible = true
+
+	local wrapWidth = state.wrapWidth
+	local size = label.TextSize + 4
+	if label.TextScaled or (label.TextWrapped and not wrapWidth) then
+		local available = label.AbsoluteSize / getCumulativeScale(label)
+		if label.TextWrapped then
+			wrapWidth = wrapWidth or available.X
+		end
+		if label.TextScaled then
+			size = getScaledSize(text, label, wrapWidth or available.X, available.Y)
+		end
+	end
+	local lines = layout2006Lines(text, size, wrapWidth)
+	local lineAdvance = size * label.LineHeight
+	local lineWidths = {}
+	local blockWidth = 0
+	for i, line in ipairs(lines) do
+		lineWidths[i] = measure2006Line(line, size)
+		blockWidth = math.max(blockWidth, lineWidths[i])
+	end
+	local alignX = 0
+	if label.TextXAlignment == Enum.TextXAlignment.Center then
+		alignX = 0.5
+	elseif label.TextXAlignment == Enum.TextXAlignment.Right then
+		alignX = 1
+	end
+	local alignY = 0
+	if label.TextYAlignment == Enum.TextYAlignment.Center then
+		alignY = 0.5
+	elseif label.TextYAlignment == Enum.TextYAlignment.Bottom then
+		alignY = 1
+	end
+	content.AnchorPoint = Vector2.new(alignX, alignY)
+	content.Position = UDim2.new(alignX, 0, alignY, 0)
+	content.Size = UDim2.fromOffset(blockWidth, (#lines - 1) * lineAdvance + size)
+
+	local textColor = label.TextColor3
+	local strokeColor = label.TextStrokeColor3
+	local strokeTransparency = state.strokeTransparency
+	if state.uiStroke then
+		strokeColor = state.uiStroke.Color
+		strokeTransparency = state.uiStroke.Transparency
+	end
+	local glyphTransparency = state.textTransparency
+	local outlineTransparency = 1 - (1 - strokeTransparency) * (1 - glyphTransparency)
+	local visibleCount = label.MaxVisibleGraphemes
+	local glyphCount = 0
+	local outlineCount = 0
+	local characterCount = 0
+	for lineIndex, line in ipairs(lines) do
+		local x = (blockWidth - lineWidths[lineIndex]) * alignX
+		local y = (lineIndex - 1) * lineAdvance
+		for i = 1, #line do
+			characterCount += 1
+			if visibleCount >= 0 and characterCount > visibleCount then
+				break
+			end
+			local code = glyphCode(string.byte(line, i))
+			local width = GLYPH_WIDTHS[code]
+			local pixelWidth = width / 32 * size
+			if code ~= 32 then
+				local rectOffset = Vector2.new((code * 32) % 512 + (32 - width) / 2, math.floor(code / 16) * 32)
+				local rectSize = Vector2.new(width, 32)
+				glyphCount += 1
+				local glyph = getPooledImage(state.glyphs, glyphCount, content, "Glyph")
+				glyph.ImageRectOffset = rectOffset
+				glyph.ImageRectSize = rectSize
+				glyph.Size = UDim2.fromOffset(pixelWidth, size)
+				glyph.Position = UDim2.fromOffset(x, y)
+				if state.prefixLength and characterCount <= state.prefixLength then
+					glyph.ImageColor3 = state.prefixColor
+				else
+					glyph.ImageColor3 = textColor
+				end
+				glyph.ImageTransparency = glyphTransparency
+				glyph.ZIndex = label.ZIndex + 2
+				if outlineTransparency < 1 then
+					for _, shift in ipairs(OUTLINE_OFFSETS) do
+						outlineCount += 1
+						local outline = getPooledImage(state.outlines, outlineCount, content, "Outline")
+						outline.ImageRectOffset = rectOffset
+						outline.ImageRectSize = rectSize
+						outline.Size = glyph.Size
+						outline.Position = UDim2.fromOffset(x + shift.X, y + shift.Y)
+						outline.ImageColor3 = strokeColor
+						outline.ImageTransparency = outlineTransparency
+						outline.ZIndex = label.ZIndex + 1
+					end
+				end
+			end
+			x += pixelWidth
+		end
+		-- the line break counts as a character, like the "\n" it replaced
+		characterCount += 1
+	end
+	for i = glyphCount + 1, #state.glyphs do
+		state.glyphs[i].Visible = false
+	end
+	for i = outlineCount + 1, #state.outlines do
+		state.outlines[i].Visible = false
+	end
+end
+
+local function safeRender2006(state)
+	if not pcall(render2006, state) then
+		pcall(show2006Fallback, state)
+	end
+end
+
+local function queue2006Render(state)
+	if state.queued then
+		return
+	end
+	state.queued = true
+	task.defer(function()
+		state.queued = false
+		safeRender2006(state)
+	end)
+end
+
+-- Gives a TextLabel or TextButton the 2006 font and keeps it up to date as it changes.
+-- opts.wrapWidth wraps at a fixed width instead of following the label's size;
+-- opts.prefixLength / opts.prefixColor colour the first characters (a chat name).
+local function apply2006Font(label, opts)
+	if fontStates[label] then
+		return
+	end
+	opts = opts or {}
+	local state = {
+		label = label,
+		wrapWidth = opts.wrapWidth,
+		prefixLength = opts.prefixLength,
+		prefixColor = opts.prefixColor,
+		textTransparency = label.TextTransparency,
+		strokeTransparency = label.TextStrokeTransparency,
+		glyphs = {},
+		outlines = {}
+	}
+	fontStates[label] = state
+	-- The state refers back to the label, so drop it once the label is gone or it would never be freed
+	label.Destroying:Connect(function()
+		fontStates[label] = nil
+	end)
+	-- Lets a later run of this script see the label is already taken care of
+	label:SetAttribute("Classic2006Font", true)
+	-- A UIStroke text outline would keep outlining the hidden text, so the renderer
+	-- turns it off and draws that outline around the letters itself
+	for _, child in ipairs(label:GetChildren()) do
+		if child:IsA("UIStroke")
+			and child.Enabled
+			and child.ApplyStrokeMode == Enum.ApplyStrokeMode.Contextual then
+			state.uiStroke = child
+			child:GetPropertyChangedSignal("Color"):Connect(function()
+				queue2006Render(state)
+			end)
+			child:GetPropertyChangedSignal("Transparency"):Connect(function()
+				queue2006Render(state)
+			end)
+			break
+		end
+	end
+	for _, property in ipairs({
+		"Text", "TextSize", "TextColor3", "TextStrokeColor3", "TextXAlignment", "TextYAlignment",
+		"TextScaled", "TextWrapped", "RichText", "LineHeight", "MaxVisibleGraphemes", "ZIndex"
+	}) do
+		label:GetPropertyChangedSignal(property):Connect(function()
+			queue2006Render(state)
+		end)
+	end
+	label:GetPropertyChangedSignal("TextTransparency"):Connect(function()
+		if math.abs(label.TextTransparency - HIDDEN) > 0.0001 then
+			state.textTransparency = label.TextTransparency
+			queue2006Render(state)
+		end
+	end)
+	label:GetPropertyChangedSignal("TextStrokeTransparency"):Connect(function()
+		if math.abs(label.TextStrokeTransparency - HIDDEN) > 0.0001 then
+			state.strokeTransparency = label.TextStrokeTransparency
+			queue2006Render(state)
+		end
+	end)
+	label:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		if label.TextScaled or (label.TextWrapped and not state.wrapWidth) then
+			queue2006Render(state)
+		end
+	end)
+	safeRender2006(state)
+end
+
+-- If the font sheet can't load (deleted, or blocked in this game), switch every
+-- 2006 label over to the fallback font
+task.spawn(function()
+	local probe = Instance.new("ImageLabel")
+	probe.Image = FONT_SHEET
+	pcall(function()
+		game:GetService("ContentProvider"):PreloadAsync({ probe }, function(_, status)
+			if status.Name == "Failure" or status.Name == "TimedOut" then
+				fontSheetFailed = true
+			end
+		end)
+	end)
+	probe:Destroy()
+	if fontSheetFailed then
+		for _, state in pairs(fontStates) do
+			queue2006Render(state)
+		end
 	end
 end)
-local GameCustomFont = nil
-if USE_GAME_2006_FONT and GameFontModule then
-	-- require on a thread with a time limit, so a module that waits on something can't stall the GUI
-	local finished = false
-	local timedOut = false
-	task.spawn(function()
-		local ok, lib = pcall(require, GameFontModule)
-		if ok and not timedOut and type(lib) == "table" and type(lib.displayString) == "function" then
-			GameCustomFont = lib
-		end
-		finished = true
-	end)
-	local started = os.clock()
-	while not finished and os.clock() - started < 3 do
-		task.wait()
-	end
-	timedOut = not finished
-end
-
-local gameFontLabels = setmetatable({}, { __mode = "k" })
-
-local function renderGameFont(label)
-	local state = gameFontLabels[label]
-	if not state then
-		return
-	end
-	local ok = pcall(
-		GameCustomFont.displayString,
-		state.text,
-		math.ceil(label.TextSize * label.LineHeight) + 4,
-		label,
-		state.stroke
-	)
-	if ok then
-		return
-	end
-	-- The game's renderer refused this label: undo it and use the built-in 2006 look
-	gameFontLabels[label] = nil
-	for _, conn in ipairs(state.connections) do
-		conn:Disconnect()
-	end
-	local leftover = label:FindFirstChild("TextContent")
-	if leftover then
-		leftover:Destroy()
-	end
-	label.Text = state.text
-	label.TextTransparency = state.transparency
-	label.TextStrokeTransparency = state.stroke
-	label.FontFace = FONT_2006
-end
-
--- Gives a text object the 2006 font. allowGameFont lets RetroStudio's bitmap renderer
--- draw it; only plain single-line TextLabels that stay put on screen should allow it.
-local function apply2006Font(label, allowGameFont)
-	if not (allowGameFont
-		and GameCustomFont
-		and label:IsA("TextLabel")
-		and not label.RichText
-		and not label.TextWrapped
-		and not label.TextScaled) then
-		label.FontFace = FONT_2006
-		return
-	end
-	local state = {
-		text = label.Text,
-		stroke = label.TextStrokeTransparency,
-		transparency = label.TextTransparency,
-		connections = {}
-	}
-	gameFontLabels[label] = state
-	label.FontFace = Font.new(GAME_FONT_MARKER)
-	table.insert(state.connections, label:GetPropertyChangedSignal("Text"):Connect(function()
-		-- The renderer may blank the label itself, so only adopt non-empty text here
-		if label.Text ~= "" and label.Text ~= state.text then
-			state.text = label.Text
-			renderGameFont(label)
-		end
-	end))
-	for _, property in ipairs({ "TextBounds", "AbsoluteSize", "AbsolutePosition", "TextColor3" }) do
-		table.insert(state.connections, label:GetPropertyChangedSignal(property):Connect(function()
-			renderGameFont(label)
-		end))
-	end
-	renderGameFont(label)
-end
-
--- Use this instead of label.Text = ... for labels given the 2006 font with allowGameFont
-local function set2006Text(label, text)
-	local state = gameFontLabels[label]
-	if not state then
-		label.Text = text
-		return
-	end
-	if state.text == text then
-		return
-	end
-	state.text = text
-	label.Text = text
-	renderGameFont(label)
-end
 --========================================================
 -- UI SCALE + HEALTH BAR BUILDER
 --========================================================
@@ -288,6 +556,10 @@ local function getClassicUIScale()
 		)
 	end
 	return 1
+end
+-- 2006 letters are TextSize + 4 tall, so sizes scaled by hand keep that + 4 in proportion
+local function scaleTextSize(textSize, scale)
+	return (textSize + 4) * scale - 4
 end
 local HEALTH_GREEN =
 	Color3.new(
@@ -317,9 +589,9 @@ local function createHealthBar(parent, scale)
 	label.BackgroundTransparency = 1
 	label.Text = "Health"
 	label.TextColor3 = Color3.fromRGB(0, 100, 255)
-	label.TextSize = 14 * scale
+	label.TextSize = scaleTextSize(14, scale)
 	label.Parent = frame
-	apply2006Font(label, true)
+	apply2006Font(label)
 	return frame, bar, label
 end
 --========================================================
@@ -368,15 +640,15 @@ local LoadingText = Instance.new("TextLabel")
 LoadingText.Name = "LoadingText"
 LoadingText.AnchorPoint = Vector2.new(0.5, 0.5)
 LoadingText.Position = UDim2.new(0.5, 0, 0.5, 0)
-LoadingText.Size = UDim2.new(1, 0, 0, 44 * loadingScale)
+LoadingText.Size = UDim2.new(1, 0, 0, 48 * loadingScale)
 LoadingText.BackgroundTransparency = 1
 LoadingText.Text = "Loading Character... Please wait..."
-LoadingText.TextSize = 30 * loadingScale
+LoadingText.TextSize = scaleTextSize(33, loadingScale)
 LoadingText.TextColor3 = Color3.fromRGB(255, 255, 255)
 LoadingText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
 LoadingText.TextStrokeTransparency = 0
 LoadingText.Parent = LoadingGui
-apply2006Font(LoadingText, true)
+apply2006Font(LoadingText)
 createHealthBar(LoadingGui, loadingScale)
 -- Stay up until the character exists (at most 10 seconds), and for at least 3 seconds
 local loadingStarted = os.clock()
@@ -456,7 +728,7 @@ local function createTopButton(
 	end
 	caption.TextSize = 14
 	caption.Parent = btn
-	apply2006Font(caption, true)
+	apply2006Font(caption)
 	return btn
 end
 createTopButton(
@@ -535,7 +807,7 @@ ListTitle.TextXAlignment =
 ListTitle.TextSize = 14
 ListTitle.Parent =
 	HeaderFrame
-apply2006Font(ListTitle, true)
+apply2006Font(ListTitle)
 local StatHeaderContainer =
 	Instance.new("Frame")
 StatHeaderContainer.Name =
@@ -748,7 +1020,7 @@ local function updateHeaderTitles()
 			label.TextSize = 14
 			label.Parent =
 				StatHeaderContainer
-			apply2006Font(label, true)
+			apply2006Font(label)
 		end
 	end
 end
@@ -804,7 +1076,7 @@ local function createOrUpdateRow(
 			Enum.TextXAlignment.Left
 		leftLabel.Parent =
 			rowFrame
-		apply2006Font(leftLabel, true)
+		apply2006Font(leftLabel)
 		local statContainer =
 			Instance.new("Frame")
 		statContainer.Name =
@@ -847,11 +1119,9 @@ local function createOrUpdateRow(
 			1,
 			0
 		)
-	set2006Text(
-		leftLabel,
+	leftLabel.Text =
 		(paddingSpaces or "")
 		.. labelText
-	)
 	leftLabel.TextSize =
 		isHeader and 12 or 14
 	leftLabel.TextColor3 =
@@ -897,7 +1167,7 @@ local function createOrUpdateRow(
 				Enum.TextXAlignment.Center
 			statLabel.Parent =
 				statContainer
-			apply2006Font(statLabel, true)
+			apply2006Font(statLabel)
 		end
 		statLabel.Size =
 			UDim2.new(
@@ -925,10 +1195,8 @@ local function createOrUpdateRow(
 					statValuesList[statName]
 				)
 		end
-		set2006Text(
-			statLabel,
+		statLabel.Text =
 			valueText
-		)
 	end
 	for _, child in ipairs(
 		statContainer:GetChildren()
@@ -1172,12 +1440,10 @@ local function connectPlayerStats(p)
 									val.Name
 								)
 							if statLabel then
-								set2006Text(
-									statLabel,
+								statLabel.Text =
 									tostring(
 										newValue
 									)
-								)
 							end
 						end
 					end
@@ -1526,25 +1792,35 @@ local function addClassicMessage(senderName, messageText)
 	local TextLabel = Instance.new("TextLabel")
 	TextLabel.Name = "MessageText"
 	TextLabel.BackgroundTransparency = 1
-	apply2006Font(TextLabel)
 	TextLabel.TextSize = 14
 	TextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
 	TextLabel.TextXAlignment = Enum.TextXAlignment.Left
 	TextLabel.TextYAlignment = Enum.TextYAlignment.Center
-	TextLabel.RichText = true
-	TextLabel.AutomaticSize = Enum.AutomaticSize.X
-	TextLabel.Size = UDim2.new(0, 0, 1, 0)
 	
-	local safeName = senderName:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-	local safeMessage = messageText:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
-	
-	TextLabel.Text = string.format(
-		'<font color="%s">%s</font>: %s',
-		colorHex,
-		safeName,
-		safeMessage
-	)
-	TextLabel.Parent = MsgFrame
+	local plainText = senderName .. ": " .. messageText
+	if string.find(plainText, "[\128-\255]") then
+		-- Letters the 2006 font doesn't have (emoji, other languages): fallback font,
+		-- with the name coloured through rich text
+		local safeName = senderName:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+		local safeMessage = messageText:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+		TextLabel.RichText = true
+		TextLabel.AutomaticSize = Enum.AutomaticSize.X
+		TextLabel.Size = UDim2.new(0, 0, 1, 0)
+		TextLabel.Text = string.format(
+			'<font color="%s">%s</font>: %s',
+			colorHex,
+			safeName,
+			safeMessage
+		)
+		TextLabel.Parent = MsgFrame
+		apply2006Font(TextLabel)
+	else
+		-- The label's own (hidden) text would size it wrong, so the 2006 width is measured directly
+		TextLabel.Size = UDim2.new(0, get2006TextWidth(plainText, 14), 1, 0)
+		TextLabel.Text = plainText
+		TextLabel.Parent = MsgFrame
+		apply2006Font(TextLabel, { prefixLength = #senderName, prefixColor = nameColor })
+	end
 end
 
 --========================================================
@@ -1571,51 +1847,19 @@ local TAIL_IMAGE = "rbxassetid://6689319522"
 
 local stacks = {}
 
+-- Bubble text is measured with the 2006 font's own letter widths
 local function measureText(text)
-	local success, result = pcall(function()
-		local params = Instance.new("GetTextBoundsParams")
-		params.Text = text
-		params.Font = FONT_2006
-		params.Size = FONT_SIZE
-		params.Width = MAX_TEXT_WIDTH
-		return TextService:GetTextBoundsAsync(params)
-	end)
-
-	if success then
-		return result
+	local size = FONT_SIZE + 4
+	local lines = layout2006Lines(text, size, MAX_TEXT_WIDTH)
+	local width = 0
+	for _, line in ipairs(lines) do
+		width = math.max(width, measure2006Line(line, size))
 	end
-
-	return Vector2.new(75, 26)
+	return Vector2.new(width, #lines * size)
 end
 
 local function wrapText(text)
-	local words = string.split(text, " ")
-	local lines = {}
-	local current = ""
-
-	for _, word in ipairs(words) do
-		local attempt
-		if current == "" then
-			attempt = word
-		else
-			attempt = current .. " " .. word
-		end
-
-		local size = measureText(attempt)
-
-		if size.X > MAX_TEXT_WIDTH and current ~= "" then
-			table.insert(lines, current)
-			current = word
-		else
-			current = attempt
-		end
-	end
-
-	if current ~= "" then
-		table.insert(lines, current)
-	end
-
-	return table.concat(lines, "\n")
+	return table.concat(layout2006Lines(text, FONT_SIZE + 4, MAX_TEXT_WIDTH), "\n")
 end
 
 local function getAnchor(head)
@@ -1769,7 +2013,6 @@ local function createClassicBubble(head, message)
 	label.Name = "Text"
 	label.BackgroundTransparency = 1
 	label.BorderSizePixel = 0
-	apply2006Font(label)
 	label.TextSize = FONT_SIZE
 	label.TextColor3 = Color3.fromRGB(0, 0, 0)
 	label.TextWrapped = true
@@ -1780,6 +2023,7 @@ local function createClassicBubble(head, message)
 	label.Size = UDim2.fromOffset(width - 22, height - 2)
 	label.ZIndex = 103 + order * 10
 	label.Parent = bubble
+	apply2006Font(label, { wrapWidth = width - 22 })
 
 	table.insert(stack.bubbles, bubble)
 
@@ -2193,7 +2437,7 @@ for i = 1, 10 do
 	numberLabel.TextSize = 12
 	numberLabel.ZIndex = 3
 	numberLabel.Parent = slot
-	apply2006Font(numberLabel, true)
+	apply2006Font(numberLabel)
 
 	local toolBtn = Instance.new("ImageButton")
 	toolBtn.Name = "ToolButton"
@@ -2208,11 +2452,11 @@ for i = 1, 10 do
 	textFallback.Size = UDim2.new(1, 0, 1, 0)
 	textFallback.BackgroundTransparency = 1
 	textFallback.TextColor3 = Color3.fromRGB(255, 255, 255)
-	apply2006Font(textFallback)
 	textFallback.TextSize = 10
 	textFallback.TextWrapped = true
 	textFallback.ZIndex = 2
 	textFallback.Parent = toolBtn
+	apply2006Font(textFallback, { wrapWidth = SLOT_SIZE - 4 })
 
 	storeConnection(
 		toolBtn.Activated:Connect(function()
@@ -2351,13 +2595,29 @@ end
 --========================================================
 -- 2006 FONT FOR THE GAME'S OWN TEXT
 --========================================================
+-- In RetroStudio the game draws its own labels (marked with this font family) in the 2006 font itself
+local GAME_FONT_MARKER = "rbxasset://fonts/families/GothamSSm.json"
+local IS_RETROSTUDIO = false
+pcall(function()
+	local replicatedStorage = game:GetService("ReplicatedStorage")
+	local modules = replicatedStorage:FindFirstChild("Modules")
+	IS_RETROSTUDIO = modules ~= nil
+		and modules:FindFirstChild("CustomFont") ~= nil
+		and replicatedStorage:FindFirstChild("TimePeriod") ~= nil
+		and replicatedStorage:FindFirstChild("Protocols") ~= nil
+end)
+
 local function convertGameText(obj)
-	if obj:IsDescendantOf(ScreenGui) then
+	if fontStates[obj] or obj:GetAttribute("Classic2006Font") or obj:IsDescendantOf(ScreenGui) then
 		return
 	end
-	-- Leave the game's chat alone, and the pieces RetroStudio draws its own 2006 font with
+	-- Leave other executor GUIs alone (they share the hidden gethui() folder with this one)
+	if parentTarget ~= CoreGui and obj:IsDescendantOf(parentTarget) then
+		return
+	end
+	-- Leave the game's chat alone, and text RetroStudio already draws in the 2006 font
 	if obj:FindFirstAncestor("Chat")
-		or obj.Name == "TextContent"
+		or obj:FindFirstChild("TextContent")
 		or obj:FindFirstAncestor("TextContent") then
 		return
 	end
@@ -2366,11 +2626,10 @@ local function convertGameText(obj)
 	if parent and parent:FindFirstChildWhichIsA("TextBox") then
 		return
 	end
-	-- RetroStudio already draws these labels with its 2006 font
-	if GameFontModule and obj.FontFace.Family == GAME_FONT_MARKER then
+	if IS_RETROSTUDIO and obj.FontFace.Family == GAME_FONT_MARKER then
 		return
 	end
-	obj.FontFace = FONT_2006
+	apply2006Font(obj)
 end
 
 local function isGameText(obj)
@@ -2378,26 +2637,33 @@ local function isGameText(obj)
 end
 
 local function watchGameText(root)
-	for _, obj in ipairs(root:GetDescendants()) do
-		if isGameText(obj) then
-			convertGameText(obj)
-		end
-	end
 	storeConnection(
 		root.DescendantAdded:Connect(function(obj)
 			if isGameText(obj) then
 				-- wait a moment so the game finishes setting the text up first
-				task.defer(convertGameText, obj)
+				task.defer(pcall, convertGameText, obj)
 			end
 		end)
 	)
+	for index, obj in ipairs(root:GetDescendants()) do
+		if isGameText(obj) then
+			pcall(convertGameText, obj)
+		end
+		-- a big GUI is taken over a bit at a time instead of freezing the game
+		if index % 200 == 0 then
+			task.wait()
+		end
+	end
 end
 
 if APPLY_2006_FONT_TO_GAME_GUIS then
-	watchGameText(LocalPlayer:WaitForChild("PlayerGui"))
+	task.spawn(watchGameText, LocalPlayer:WaitForChild("PlayerGui"))
 end
 if APPLY_2006_FONT_TO_WORLD_TEXT then
-	watchGameText(Workspace)
+	task.spawn(watchGameText, Workspace)
+end
+if APPLY_2006_FONT_TO_ROBLOX_MENUS then
+	task.spawn(watchGameText, CoreGui)
 end
 
 --========================================================
