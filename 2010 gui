@@ -3,6 +3,17 @@
 -- [[ LOCAL-ONLY CLASSIC CHAT BUBBLE ]]
 -- [[ CUSTOM BUBBLE FOR LOCALPLAYER + OTHER PLAYERS ON THIS CLIENT ]]
 -- [[ NO LEGACY CHAT FALLBACK ]]
+-- [[ 2006 FONT + 2006 "LOADING CHARACTER" SCREEN ]]
+--========================================================
+-- SETTINGS
+--========================================================
+-- In RetroStudio, draw this GUI with the game's own 2006 bitmap font.
+-- If that text ever looks wrong, set this to false to use the built-in 2006 look instead.
+local USE_GAME_2006_FONT = true
+-- Also switch the game's own on-screen text (PlayerGui) to the 2006 font. Text boxes are never touched.
+local APPLY_2006_FONT_TO_GAME_GUIS = true
+-- Also switch signs and name tags in the world (BillboardGui / SurfaceGui) to the 2006 font.
+local APPLY_2006_FONT_TO_WORLD_TEXT = false
 --========================================================
 -- CLEANUP
 --========================================================
@@ -117,162 +128,263 @@ pcall(function()
 		parentTarget = gethui()
 	end
 end)
+local function parentGui(gui)
+	local success =
+		pcall(function()
+			gui.Parent = parentTarget
+		end)
+	if not success or not gui.Parent then
+		gui.Parent =
+			LocalPlayer:WaitForChild("PlayerGui")
+	end
+end
+-- Remove the GUI left behind by an earlier run of this script
+for _, container in ipairs({ parentTarget, LocalPlayer:FindFirstChildOfClass("PlayerGui") }) do
+	pcall(function()
+		for _, child in ipairs(container:GetChildren()) do
+			if child.Name == "Classic2010Gui" then
+				child:Destroy()
+			end
+		end
+	end)
+end
+--========================================================
+-- 2006 FONT
+--========================================================
+-- The 2006 client drew its GUI text with a bitmap copy of Eras Demi ITC,
+-- which Roblox doesn't ship. Text is drawn one of two ways:
+--  * In RetroStudio, the game's own 2006 renderer (ReplicatedStorage.Modules.CustomFont)
+--    draws our labels, called the same way the game's ClientLocalPlayerScripts calls it.
+--  * Everywhere else, Nunito ExtraBold Italic: the closest built-in font to Eras Demi.
+local FONT_2006 = Font.new(
+	"rbxasset://fonts/families/Nunito.json",
+	Enum.FontWeight.ExtraBold,
+	Enum.FontStyle.Italic
+)
+-- RetroStudio marks the labels its renderer should draw with this family
+local GAME_FONT_MARKER = "rbxasset://fonts/families/GothamSSm.json"
+local GameFontModule = nil
+pcall(function()
+	local replicatedStorage = game:GetService("ReplicatedStorage")
+	local modules = replicatedStorage:FindFirstChild("Modules")
+	local module = modules and modules:FindFirstChild("CustomFont")
+	if module and module:IsA("ModuleScript")
+		and replicatedStorage:FindFirstChild("TimePeriod")
+		and replicatedStorage:FindFirstChild("Protocols") then
+		GameFontModule = module
+	end
+end)
+local GameCustomFont = nil
+if USE_GAME_2006_FONT and GameFontModule then
+	-- require on a thread with a time limit, so a module that waits on something can't stall the GUI
+	local finished = false
+	local timedOut = false
+	task.spawn(function()
+		local ok, lib = pcall(require, GameFontModule)
+		if ok and not timedOut and type(lib) == "table" and type(lib.displayString) == "function" then
+			GameCustomFont = lib
+		end
+		finished = true
+	end)
+	local started = os.clock()
+	while not finished and os.clock() - started < 3 do
+		task.wait()
+	end
+	timedOut = not finished
+end
+
+local gameFontLabels = setmetatable({}, { __mode = "k" })
+
+local function renderGameFont(label)
+	local state = gameFontLabels[label]
+	if not state then
+		return
+	end
+	local ok = pcall(
+		GameCustomFont.displayString,
+		state.text,
+		math.ceil(label.TextSize * label.LineHeight) + 4,
+		label,
+		state.stroke
+	)
+	if ok then
+		return
+	end
+	-- The game's renderer refused this label: undo it and use the built-in 2006 look
+	gameFontLabels[label] = nil
+	for _, conn in ipairs(state.connections) do
+		conn:Disconnect()
+	end
+	local leftover = label:FindFirstChild("TextContent")
+	if leftover then
+		leftover:Destroy()
+	end
+	label.Text = state.text
+	label.TextTransparency = state.transparency
+	label.TextStrokeTransparency = state.stroke
+	label.FontFace = FONT_2006
+end
+
+-- Gives a text object the 2006 font. allowGameFont lets RetroStudio's bitmap renderer
+-- draw it; only plain single-line TextLabels that stay put on screen should allow it.
+local function apply2006Font(label, allowGameFont)
+	if not (allowGameFont
+		and GameCustomFont
+		and label:IsA("TextLabel")
+		and not label.RichText
+		and not label.TextWrapped
+		and not label.TextScaled) then
+		label.FontFace = FONT_2006
+		return
+	end
+	local state = {
+		text = label.Text,
+		stroke = label.TextStrokeTransparency,
+		transparency = label.TextTransparency,
+		connections = {}
+	}
+	gameFontLabels[label] = state
+	label.FontFace = Font.new(GAME_FONT_MARKER)
+	table.insert(state.connections, label:GetPropertyChangedSignal("Text"):Connect(function()
+		-- The renderer may blank the label itself, so only adopt non-empty text here
+		if label.Text ~= "" and label.Text ~= state.text then
+			state.text = label.Text
+			renderGameFont(label)
+		end
+	end))
+	for _, property in ipairs({ "TextBounds", "AbsoluteSize", "AbsolutePosition", "TextColor3" }) do
+		table.insert(state.connections, label:GetPropertyChangedSignal(property):Connect(function()
+			renderGameFont(label)
+		end))
+	end
+	renderGameFont(label)
+end
+
+-- Use this instead of label.Text = ... for labels given the 2006 font with allowGameFont
+local function set2006Text(label, text)
+	local state = gameFontLabels[label]
+	if not state then
+		label.Text = text
+		return
+	end
+	if state.text == text then
+		return
+	end
+	state.text = text
+	label.Text = text
+	renderGameFont(label)
+end
+--========================================================
+-- UI SCALE + HEALTH BAR BUILDER
+--========================================================
+local function getClassicUIScale()
+	local viewport = Camera.ViewportSize
+	if viewport.Y < 800
+		or viewport.X < 1200 then
+		return math.clamp(
+			viewport.Y / 900,
+			0.55,
+			1
+		)
+	end
+	return 1
+end
+local HEALTH_GREEN =
+	Color3.new(
+		0.5058824,
+		0.7725491,
+		0.08627451
+	)
+local function createHealthBar(parent, scale)
+	local frame = Instance.new("Frame")
+	frame.Name = "ClassicHealthFrame"
+	frame.AnchorPoint = Vector2.new(1, 0.5)
+	frame.Size = UDim2.new(0, 14 * scale, 0, 200 * scale)
+	frame.Position = UDim2.new(1, -20 * scale, 0.5, 0)
+	frame.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+	frame.BorderSizePixel = 0
+	frame.Parent = parent
+	local bar = Instance.new("Frame")
+	bar.Name = "Bar"
+	bar.Size = UDim2.new(1, 0, 1, 0)
+	bar.BackgroundColor3 = HEALTH_GREEN
+	bar.BorderSizePixel = 0
+	bar.Parent = frame
+	local label = Instance.new("TextLabel")
+	label.Name = "HealthLabel"
+	label.Size = UDim2.new(0, 50 * scale, 0, 15 * scale)
+	label.Position = UDim2.new(0, -18 * scale, 1, 5 * scale)
+	label.BackgroundTransparency = 1
+	label.Text = "Health"
+	label.TextColor3 = Color3.fromRGB(0, 100, 255)
+	label.TextSize = 14 * scale
+	label.Parent = frame
+	apply2006Font(label, true)
+	return frame, bar, label
+end
 --========================================================
 -- LOADING SCREEN
 --========================================================
+-- The 2006 "Loading Character" screen: the bare baseplate fading into grey fog,
+-- the message in the middle and the health bar on the right.
 local LoadingGui = Instance.new("ScreenGui")
 LoadingGui.Name = "LoadingGui"
 LoadingGui.ResetOnSpawn = false
 LoadingGui.IgnoreGuiInset = true
-local success =
-	pcall(function()
-		LoadingGui.Parent = parentTarget
-	end)
-if not success or not LoadingGui.Parent then
-	LoadingGui.Parent =
-		LocalPlayer:WaitForChild("PlayerGui")
+LoadingGui.DisplayOrder = 10
+parentGui(LoadingGui)
+-- Sized by hand with the same factor as the main GUI's UIScale, so the health bar
+-- stays put when this screen is swapped for the main GUI
+local loadingScale = getClassicUIScale()
+local LoadingSky = Instance.new("Frame")
+LoadingSky.Name = "Sky"
+LoadingSky.Size = UDim2.new(1, 0, 1, 0)
+LoadingSky.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+LoadingSky.BorderSizePixel = 0
+LoadingSky.Parent = LoadingGui
+local SkyGradient = Instance.new("UIGradient")
+SkyGradient.Rotation = 90
+SkyGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(124, 124, 128)),
+	ColorSequenceKeypoint.new(0.35, Color3.fromRGB(104, 105, 110)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(103, 104, 109))
+})
+SkyGradient.Parent = LoadingSky
+-- The baseplate in perspective: a trapezoid built from thin strips, 47% of the
+-- screen wide at the horizon and 77% wide at the bottom edge
+local GROUND_TOP = 0.58
+local GROUND_STRIPS = 84
+for i = 0, GROUND_STRIPS - 1 do
+	local strip = Instance.new("Frame")
+	strip.Name = "Ground"
+	strip.AnchorPoint = Vector2.new(0.5, 0)
+	strip.Position = UDim2.new(0.5, 0, GROUND_TOP + (1 - GROUND_TOP) * i / GROUND_STRIPS, 0)
+	strip.Size = UDim2.new(0.472 + 0.298 * (i + 0.5) / GROUND_STRIPS, 0, (1 - GROUND_TOP) / GROUND_STRIPS, 1)
+	strip.BackgroundColor3 = Color3.fromRGB(111, 112, 116)
+	strip.BorderSizePixel = 0
+	strip.Parent = LoadingSky
 end
-Camera.CameraType = Enum.CameraType.Scriptable
-Camera.CFrame =
-	CFrame.new(
-		Vector3.new(0, 30, 80),
-		Vector3.new(0, 10, 0)
-	)
-local touchGui =
-	LocalPlayer:WaitForChild("PlayerGui"):
-	FindFirstChild("TouchGui")
-if touchGui then
-	touchGui.Enabled = false
+local LoadingText = Instance.new("TextLabel")
+LoadingText.Name = "LoadingText"
+LoadingText.AnchorPoint = Vector2.new(0.5, 0.5)
+LoadingText.Position = UDim2.new(0.5, 0, 0.5, 0)
+LoadingText.Size = UDim2.new(1, 0, 0, 44 * loadingScale)
+LoadingText.BackgroundTransparency = 1
+LoadingText.Text = "Loading Character... Please wait..."
+LoadingText.TextSize = 30 * loadingScale
+LoadingText.TextColor3 = Color3.fromRGB(255, 255, 255)
+LoadingText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+LoadingText.TextStrokeTransparency = 0
+LoadingText.Parent = LoadingGui
+apply2006Font(LoadingText, true)
+createHealthBar(LoadingGui, loadingScale)
+-- Stay up until the character exists (at most 10 seconds), and for at least 3 seconds
+local loadingStarted = os.clock()
+while os.clock() - loadingStarted < 10
+	and not (LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")) do
+	task.wait(0.1)
 end
-local mapParts = {}
-for _, obj in ipairs(Workspace:GetDescendants()) do
-	if obj:IsA("BasePart")
-		and obj.Parent ~= LocalPlayer.Character
-		and not obj:IsDescendantOf(LocalPlayer.Character) then
-		table.insert(
-			mapParts,
-			{
-				Part = obj,
-				OriginalTransparency = obj.Transparency
-			}
-		)
-		obj.Transparency = 1
-	end
-end
-local font = Font.new(
-	"rbxasset://fonts/families/Arial.json",
-	Enum.FontWeight.Bold,
-	Enum.FontStyle.Normal
-)
-local ConnectingFrame = Instance.new("Frame")
-ConnectingFrame.Name = "ConnectingFrame"
-ConnectingFrame.AnchorPoint =
-	Vector2.new(0.5, 0.5)
-ConnectingFrame.Position =
-	UDim2.new(0.5, 0, 0.5, 0)
-ConnectingFrame.Size =
-	UDim2.new(0, 500, 0, 160)
-ConnectingFrame.BackgroundColor3 =
-	Color3.fromRGB(220, 220, 220)
-ConnectingFrame.BackgroundTransparency = 0.5
-ConnectingFrame.BorderColor3 =
-	Color3.fromRGB(255, 255, 255)
-ConnectingFrame.BorderSizePixel = 1
-ConnectingFrame.Parent = LoadingGui
-local ConnectingText = Instance.new("TextLabel")
-ConnectingText.Name = "ConnectingText"
-ConnectingText.Size =
-	UDim2.new(1, 0, 1, 0)
-ConnectingText.BackgroundTransparency = 1
-ConnectingText.FontFace = font
-ConnectingText.TextSize = 22
-ConnectingText.TextColor3 =
-	Color3.fromRGB(255, 255, 255)
-ConnectingText.Text =
-	"Connecting to Server"
-ConnectingText.Parent =
-	ConnectingFrame
-task.wait(2)
-ConnectingFrame:Destroy()
-local StatsFrame = Instance.new("Frame")
-StatsFrame.Name = "StatsFrame"
-StatsFrame.AnchorPoint =
-	Vector2.new(0.5, 0.5)
-StatsFrame.Position =
-	UDim2.new(0.5, 0, 0.5, 0)
-StatsFrame.Size =
-	UDim2.new(0, 500, 0, 160)
-StatsFrame.BackgroundColor3 =
-	Color3.fromRGB(220, 220, 220)
-StatsFrame.BackgroundTransparency = 0.5
-StatsFrame.BorderColor3 =
-	Color3.fromRGB(255, 255, 255)
-StatsFrame.BorderSizePixel = 3
-StatsFrame.Parent = LoadingGui
-local StatsText = Instance.new("TextLabel")
-StatsText.Name = "StatsText"
-StatsText.Size =
-	UDim2.new(1, 0, 1, 0)
-StatsText.BackgroundTransparency = 1
-StatsText.FontFace = font
-StatsText.TextSize = 20
-StatsText.TextColor3 =
-	Color3.fromRGB(255, 255, 255)
-StatsText.Text =
-	"Bricks: 0   Connectors: 0"
-StatsText.Parent = StatsFrame
-local totalBricks = #mapParts
-local targetConnectors = #Players:GetPlayers()
-local steps = 30
-local partsPerStep =
-	math.ceil(totalBricks / steps)
-local currentIndex = 1
-for i = 1, steps do
-	local currentBricks =
-		math.floor(
-			(totalBricks / steps) * i
-		)
-	local currentConnectors =
-		math.floor(
-			(targetConnectors / steps) * i
-		)
-	for j = 1, partsPerStep do
-		if mapParts[currentIndex] then
-			local data =
-				mapParts[currentIndex]
-			data.Part.Transparency =
-				data.OriginalTransparency
-			currentIndex =
-				currentIndex + 1
-		end
-	end
-	StatsText.Text =
-		"Bricks: "
-		.. tostring(currentBricks)
-		.. "   Connectors: "
-		.. tostring(currentConnectors)
-	task.wait(0.05)
-end
-for _, data in ipairs(mapParts) do
-	data.Part.Transparency =
-		data.OriginalTransparency
-end
-StatsText.Text =
-	"Bricks: "
-	.. tostring(totalBricks)
-	.. "   Connectors: "
-	.. tostring(targetConnectors)
-task.wait(1.5)
-Camera.CameraType =
-	Enum.CameraType.Custom
-if LocalPlayer.Character
-	and LocalPlayer.Character:FindFirstChild("Humanoid") then
-	Camera.CameraSubject =
-		LocalPlayer.Character.Humanoid
-end
-if touchGui then
-	touchGui.Enabled = true
-end
+task.wait(math.max(0, 3 - (os.clock() - loadingStarted)))
 LoadingGui:Destroy()
 --========================================================
 -- MAIN SCREEN GUI
@@ -281,22 +393,11 @@ local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name = "Classic2010Gui"
 ScreenGui.ResetOnSpawn = false
 ScreenGui.IgnoreGuiInset = true
-ScreenGui.Parent = parentTarget
+parentGui(ScreenGui)
 local uiScale = Instance.new("UIScale")
 uiScale.Parent = ScreenGui
 local function updateUIScale()
-	local viewport = Camera.ViewportSize
-	if viewport.Y < 800
-		or viewport.X < 1200 then
-		uiScale.Scale =
-			math.clamp(
-				viewport.Y / 900,
-				0.55,
-				1
-			)
-	else
-		uiScale.Scale = 1
-	end
+	uiScale.Scale = getClassicUIScale()
 end
 storeConnection(
 	Camera:GetPropertyChangedSignal(
@@ -335,19 +436,27 @@ local function createTopButton(
 	btn.BorderSizePixel = 0
 	btn.BorderColor3 =
 		Color3.fromRGB(100, 100, 100)
-	btn.Text = text
-	if isWhiteText then
-		btn.TextColor3 =
-			Color3.fromRGB(255, 255, 255)
-		btn.TextTransparency = 0.75
-	else
-		btn.TextColor3 =
-			Color3.fromRGB(0, 0, 0)
-		btn.TextTransparency = 0.65
-	end
-	btn.Font = Enum.Font.ArialBold
-	btn.TextSize = 14
+	btn.Text = ""
 	btn.Parent = TopBar
+	-- The caption is its own TextLabel (like RetroStudio's top bar) so the 2006 renderer can draw it
+	local caption = Instance.new("TextLabel")
+	caption.Name = "ButtonText"
+	caption.Size =
+		UDim2.new(1, 0, 1, 0)
+	caption.BackgroundTransparency = 1
+	caption.Text = text
+	if isWhiteText then
+		caption.TextColor3 =
+			Color3.fromRGB(255, 255, 255)
+		caption.TextTransparency = 0.75
+	else
+		caption.TextColor3 =
+			Color3.fromRGB(0, 0, 0)
+		caption.TextTransparency = 0.65
+	end
+	caption.TextSize = 14
+	caption.Parent = btn
+	apply2006Font(caption, true)
 	return btn
 end
 createTopButton(
@@ -423,11 +532,10 @@ ListTitle.TextColor3 =
 	Color3.fromRGB(255, 255, 255)
 ListTitle.TextXAlignment =
 	Enum.TextXAlignment.Left
-ListTitle.Font =
-	Enum.Font.ArialBold
 ListTitle.TextSize = 14
 ListTitle.Parent =
 	HeaderFrame
+apply2006Font(ListTitle, true)
 local StatHeaderContainer =
 	Instance.new("Frame")
 StatHeaderContainer.Name =
@@ -637,11 +745,10 @@ local function updateHeaderTitles()
 				)
 			label.TextXAlignment =
 				Enum.TextXAlignment.Center
-			label.Font =
-				Enum.Font.ArialBold
 			label.TextSize = 14
 			label.Parent =
 				StatHeaderContainer
+			apply2006Font(label, true)
 		end
 	end
 end
@@ -693,12 +800,11 @@ local function createOrUpdateRow(
 		leftLabel.Name =
 			"LeftLabel"
 		leftLabel.BackgroundTransparency = 1
-		leftLabel.Font =
-			Enum.Font.ArialBold
 		leftLabel.TextXAlignment =
 			Enum.TextXAlignment.Left
 		leftLabel.Parent =
 			rowFrame
+		apply2006Font(leftLabel, true)
 		local statContainer =
 			Instance.new("Frame")
 		statContainer.Name =
@@ -741,9 +847,11 @@ local function createOrUpdateRow(
 			1,
 			0
 		)
-	leftLabel.Text =
+	set2006Text(
+		leftLabel,
 		(paddingSpaces or "")
 		.. labelText
+	)
 	leftLabel.TextSize =
 		isHeader and 12 or 14
 	leftLabel.TextColor3 =
@@ -785,12 +893,11 @@ local function createOrUpdateRow(
 			statLabel.Name =
 				statName
 			statLabel.BackgroundTransparency = 1
-			statLabel.Font =
-				Enum.Font.ArialBold
 			statLabel.TextXAlignment =
 				Enum.TextXAlignment.Center
 			statLabel.Parent =
 				statContainer
+			apply2006Font(statLabel, true)
 		end
 		statLabel.Size =
 			UDim2.new(
@@ -818,8 +925,10 @@ local function createOrUpdateRow(
 					statValuesList[statName]
 				)
 		end
-		statLabel.Text =
+		set2006Text(
+			statLabel,
 			valueText
+		)
 	end
 	for _, child in ipairs(
 		statContainer:GetChildren()
@@ -1063,10 +1172,12 @@ local function connectPlayerStats(p)
 									val.Name
 								)
 							if statLabel then
-								statLabel.Text =
+								set2006Text(
+									statLabel,
 									tostring(
 										newValue
 									)
+								)
 							end
 						end
 					end
@@ -1135,52 +1246,8 @@ updatePlayerList()
 --========================================================
 -- HEALTH BAR
 --========================================================
-local HealthFrame =
-	Instance.new("Frame")
-HealthFrame.Name =
-	"ClassicHealthFrame"
-HealthFrame.AnchorPoint =
-	Vector2.new(1, 0.5)
-HealthFrame.Size =
-	UDim2.new(0, 14, 0, 200)
-HealthFrame.Position =
-	UDim2.new(1, -20, 0.5, 0)
-HealthFrame.BackgroundColor3 =
-	Color3.fromRGB(255, 0, 0)
-HealthFrame.BorderSizePixel = 0
-HealthFrame.Parent =
-	ScreenGui
-local HealthBar =
-	Instance.new("Frame")
-HealthBar.Name = "Bar"
-HealthBar.Size =
-	UDim2.new(1, 0, 1, 0)
-HealthBar.Position =
-	UDim2.new(0, 0, 0, 0)
-HealthBar.BackgroundColor3 =
-	Color3.new(
-		0.5058824,
-		0.7725491,
-		0.08627451
-	)
-HealthBar.BorderSizePixel = 0
-HealthBar.Parent =
-	HealthFrame
-local HealthLabel =
-	Instance.new("TextLabel")
-HealthLabel.Size =
-	UDim2.new(0, 50, 0, 15)
-HealthLabel.Position =
-	UDim2.new(0, -18, 1, 5)
-HealthLabel.BackgroundTransparency = 1
-HealthLabel.Text = "Health"
-HealthLabel.TextColor3 =
-	Color3.fromRGB(0, 100, 255)
-HealthLabel.Font =
-	Enum.Font.ArialBold
-HealthLabel.TextSize = 14
-HealthLabel.Parent =
-	HealthFrame
+local _, HealthBar =
+	createHealthBar(ScreenGui, 1)
 local function setupHealthTracking(character)
 	local humanoid =
 		character:WaitForChild(
@@ -1219,11 +1286,7 @@ local function setupHealthTracking(character)
 					)
 			else
 				HealthBar.BackgroundColor3 =
-					Color3.new(
-						0.5058824,
-						0.7725491,
-						0.08627451
-					)
+					HEALTH_GREEN
 			end
 		end
 		storeConnection(
@@ -1285,6 +1348,7 @@ end
 --========================================================
 -- CHAT INPUT BAR
 --========================================================
+-- White box with black text. It keeps its plain font on purpose (no 2006 font here).
 local BottomChatBar =
 	Instance.new("Frame")
 BottomChatBar.Name =
@@ -1307,9 +1371,9 @@ BottomChatBar.Position =
 	)
 BottomChatBar.BackgroundColor3 =
 	Color3.fromRGB(
-		50,
-		50,
-		50
+		255,
+		255,
+		255
 	)
 BottomChatBar.BorderSizePixel = 0
 BottomChatBar.Active = true
@@ -1339,9 +1403,9 @@ ChatPromptLabel.Font =
 ChatPromptLabel.TextSize = 13
 ChatPromptLabel.TextColor3 =
 	Color3.fromRGB(
-		254,
-		252,
-		196
+		0,
+		0,
+		0
 	)
 ChatPromptLabel.TextXAlignment =
 	Enum.TextXAlignment.Left
@@ -1374,9 +1438,9 @@ HiddenTextBox.BackgroundTransparency = 1
 HiddenTextBox.Text = ""
 HiddenTextBox.TextColor3 =
 	Color3.fromRGB(
-		254,
-		252,
-		196
+		0,
+		0,
+		0
 	)
 HiddenTextBox.TextTransparency = 0
 HiddenTextBox.Font =
@@ -1462,7 +1526,7 @@ local function addClassicMessage(senderName, messageText)
 	local TextLabel = Instance.new("TextLabel")
 	TextLabel.Name = "MessageText"
 	TextLabel.BackgroundTransparency = 1
-	TextLabel.Font = Enum.Font.Arial
+	apply2006Font(TextLabel)
 	TextLabel.TextSize = 14
 	TextLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
 	TextLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -1507,20 +1571,14 @@ local TAIL_IMAGE = "rbxassetid://6689319522"
 
 local stacks = {}
 
-local classicFont = Font.new(
-	"rbxasset://fonts/families/Arial.json",
-	Enum.FontWeight.Regular,
-	Enum.FontStyle.Normal
-)
-
 local function measureText(text)
 	local success, result = pcall(function()
-		return TextService:GetTextSize(
-			text,
-			FONT_SIZE,
-			Enum.Font.Arial,
-			Vector2.new(MAX_TEXT_WIDTH, 1000)
-		)
+		local params = Instance.new("GetTextBoundsParams")
+		params.Text = text
+		params.Font = FONT_2006
+		params.Size = FONT_SIZE
+		params.Width = MAX_TEXT_WIDTH
+		return TextService:GetTextBoundsAsync(params)
 	end)
 
 	if success then
@@ -1711,7 +1769,7 @@ local function createClassicBubble(head, message)
 	label.Name = "Text"
 	label.BackgroundTransparency = 1
 	label.BorderSizePixel = 0
-	label.FontFace = classicFont
+	apply2006Font(label)
 	label.TextSize = FONT_SIZE
 	label.TextColor3 = Color3.fromRGB(0, 0, 0)
 	label.TextWrapped = true
@@ -1960,28 +2018,13 @@ local RightPalette = Instance.new("Frame")
 RightPalette.Name = "RightPalette"
 RightPalette.AnchorPoint = Vector2.new(1, 1)
 RightPalette.Position = UDim2.new(1, -12, 1, -32)
-RightPalette.Size = UDim2.new(0, 48, 0, 124)
+RightPalette.Size = UDim2.new(0, 48, 0, 104)
 RightPalette.BackgroundTransparency = 1
 RightPalette.Parent = ScreenGui
 
-local VideoImagePanel = Instance.new("Frame")
-VideoImagePanel.Name = "VideoImagePanel"
-VideoImagePanel.Position = UDim2.new(0, 0, 0, 36)
-VideoImagePanel.Size = UDim2.new(0, 48, 0, 20)
-VideoImagePanel.BackgroundTransparency = 1
-VideoImagePanel.Parent = RightPalette
-
-local Screenshot = Instance.new("ImageButton")
-Screenshot.Name = "Screenshot"
-Screenshot.Position = UDim2.new(0.5, -10, 0, 0)
-Screenshot.Size = UDim2.new(0, 20, 0, 20)
-Screenshot.BackgroundTransparency = 1
-Screenshot.Image = "rbxassetid://4456953824"
-Screenshot.Parent = VideoImagePanel
-
 local CameraPanel = Instance.new("Frame")
 CameraPanel.Name = "CameraPanel"
-CameraPanel.Position = UDim2.new(0, 0, 0, 56)
+CameraPanel.Position = UDim2.new(0, 0, 0, 36)
 CameraPanel.Size = UDim2.new(0, 48, 0, 48)
 CameraPanel.BackgroundTransparency = 1
 CameraPanel.Parent = RightPalette
@@ -2083,18 +2126,6 @@ storeConnection(
 )
 
 storeConnection(
-	Screenshot.MouseButton1Click:Connect(function()
-		pcall(function()
-			StarterGui:SetCore("SendNotification", {
-				Title = "Classic Roblox",
-				Text = "Screenshot action triggered!",
-				Duration = 2
-			})
-		end)
-	end)
-)
-
-storeConnection(
 	ReportAbuse.MouseButton1Click:Connect(function()
 		local GuiService = game:GetService("GuiService")
 		pcall(function()
@@ -2158,11 +2189,11 @@ for i = 1, 10 do
 	numberLabel.BackgroundTransparency = 0.25
 	numberLabel.Text = tostring(i == 10 and 0 or i)
 	numberLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-	numberLabel.Font = Enum.Font.ArialBold
 	numberLabel.BorderSizePixel = 0
 	numberLabel.TextSize = 12
 	numberLabel.ZIndex = 3
 	numberLabel.Parent = slot
+	apply2006Font(numberLabel, true)
 
 	local toolBtn = Instance.new("ImageButton")
 	toolBtn.Name = "ToolButton"
@@ -2177,7 +2208,7 @@ for i = 1, 10 do
 	textFallback.Size = UDim2.new(1, 0, 1, 0)
 	textFallback.BackgroundTransparency = 1
 	textFallback.TextColor3 = Color3.fromRGB(255, 255, 255)
-	textFallback.Font = Enum.Font.Arial
+	apply2006Font(textFallback)
 	textFallback.TextSize = 10
 	textFallback.TextWrapped = true
 	textFallback.ZIndex = 2
@@ -2315,6 +2346,58 @@ end
 storeConnection(LocalPlayer.CharacterAdded:Connect(setupBackpackConnections))
 if LocalPlayer.Character then
 	setupBackpackConnections(LocalPlayer.Character)
+end
+
+--========================================================
+-- 2006 FONT FOR THE GAME'S OWN TEXT
+--========================================================
+local function convertGameText(obj)
+	if obj:IsDescendantOf(ScreenGui) then
+		return
+	end
+	-- Leave the game's chat alone, and the pieces RetroStudio draws its own 2006 font with
+	if obj:FindFirstAncestor("Chat")
+		or obj.Name == "TextContent"
+		or obj:FindFirstAncestor("TextContent") then
+		return
+	end
+	-- Leave typing boxes' hint text alone too (like a game's own "To chat click here..." bar)
+	local parent = obj.Parent
+	if parent and parent:FindFirstChildWhichIsA("TextBox") then
+		return
+	end
+	-- RetroStudio already draws these labels with its 2006 font
+	if GameFontModule and obj.FontFace.Family == GAME_FONT_MARKER then
+		return
+	end
+	obj.FontFace = FONT_2006
+end
+
+local function isGameText(obj)
+	return obj:IsA("TextLabel") or obj:IsA("TextButton")
+end
+
+local function watchGameText(root)
+	for _, obj in ipairs(root:GetDescendants()) do
+		if isGameText(obj) then
+			convertGameText(obj)
+		end
+	end
+	storeConnection(
+		root.DescendantAdded:Connect(function(obj)
+			if isGameText(obj) then
+				-- wait a moment so the game finishes setting the text up first
+				task.defer(convertGameText, obj)
+			end
+		end)
+	)
+end
+
+if APPLY_2006_FONT_TO_GAME_GUIS then
+	watchGameText(LocalPlayer:WaitForChild("PlayerGui"))
+end
+if APPLY_2006_FONT_TO_WORLD_TEXT then
+	watchGameText(Workspace)
 end
 
 --========================================================
