@@ -7,6 +7,9 @@
 --========================================================
 -- SETTINGS
 --========================================================
+-- Chat bubbles over players' heads. 2006 Roblox had none, so they're off;
+-- chat still shows in the top-left corner.
+local SHOW_CHAT_BUBBLES = false
 -- Also switch the game's own on-screen text (PlayerGui) to the 2006 font. Text boxes are never touched.
 local APPLY_2006_FONT_TO_GAME_GUIS = true
 -- Also switch signs and name tags in the world (BillboardGui / SurfaceGui) to the 2006 font.
@@ -108,6 +111,16 @@ local function disableDefaultBubbles()
 			bubbleConfig.Enabled = false
 		end
 	end)
+	-- Games on the old chat system draw their bubbles in a "BubbleChat" ScreenGui
+	-- (this script's own bubbles only work with the new chat, so those stay if bubbles are on)
+	if not SHOW_CHAT_BUBBLES then
+		pcall(function()
+			local legacyBubbles = LocalPlayer:FindFirstChildOfClass("PlayerGui"):FindFirstChild("BubbleChat")
+			if legacyBubbles and legacyBubbles:IsA("ScreenGui") then
+				legacyBubbles.Enabled = false
+			end
+		end)
+	end
 end
 
 disableDefaultBubbles()
@@ -543,7 +556,7 @@ task.spawn(function()
 	end
 end)
 --========================================================
--- UI SCALE + HEALTH BAR BUILDER
+-- UI SCALE
 --========================================================
 local function getClassicUIScale()
 	local viewport = Camera.ViewportSize
@@ -561,52 +574,19 @@ end
 local function scaleTextSize(textSize, scale)
 	return (textSize + 4) * scale - 4
 end
-local HEALTH_GREEN =
-	Color3.new(
-		0.5058824,
-		0.7725491,
-		0.08627451
-	)
-local function createHealthBar(parent, scale)
-	local frame = Instance.new("Frame")
-	frame.Name = "ClassicHealthFrame"
-	frame.AnchorPoint = Vector2.new(1, 0.5)
-	frame.Size = UDim2.new(0, 14 * scale, 0, 200 * scale)
-	frame.Position = UDim2.new(1, -20 * scale, 0.5, 0)
-	frame.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
-	frame.BorderSizePixel = 0
-	frame.Parent = parent
-	local bar = Instance.new("Frame")
-	bar.Name = "Bar"
-	bar.Size = UDim2.new(1, 0, 1, 0)
-	bar.BackgroundColor3 = HEALTH_GREEN
-	bar.BorderSizePixel = 0
-	bar.Parent = frame
-	local label = Instance.new("TextLabel")
-	label.Name = "HealthLabel"
-	label.Size = UDim2.new(0, 50 * scale, 0, 15 * scale)
-	label.Position = UDim2.new(0, -18 * scale, 1, 5 * scale)
-	label.BackgroundTransparency = 1
-	label.Text = "Health"
-	label.TextColor3 = Color3.fromRGB(0, 100, 255)
-	label.TextSize = scaleTextSize(14, scale)
-	label.Parent = frame
-	apply2006Font(label)
-	return frame, bar, label
-end
 --========================================================
 -- LOADING SCREEN
 --========================================================
--- The 2006 "Loading Character" screen: the bare baseplate fading into grey fog,
--- the message in the middle and the health bar on the right.
+-- The 2006 "Loading Character" screen: the bare baseplate fading into grey fog
+-- with the message in the middle. The rest of the GUI (health bar included)
+-- only shows up once it's done.
 local LoadingGui = Instance.new("ScreenGui")
 LoadingGui.Name = "LoadingGui"
 LoadingGui.ResetOnSpawn = false
 LoadingGui.IgnoreGuiInset = true
 LoadingGui.DisplayOrder = 10
 parentGui(LoadingGui)
--- Sized by hand with the same factor as the main GUI's UIScale, so the health bar
--- stays put when this screen is swapped for the main GUI
+-- Sized by hand with the same factor as the main GUI's UIScale
 local loadingScale = getClassicUIScale()
 local LoadingSky = Instance.new("Frame")
 LoadingSky.Name = "Sky"
@@ -649,7 +629,6 @@ LoadingText.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
 LoadingText.TextStrokeTransparency = 0
 LoadingText.Parent = LoadingGui
 apply2006Font(LoadingText)
-createHealthBar(LoadingGui, loadingScale)
 -- Stay up until the character exists (at most 10 seconds), and for at least 3 seconds
 local loadingStarted = os.clock()
 while os.clock() - loadingStarted < 10
@@ -1512,8 +1491,40 @@ updatePlayerList()
 --========================================================
 -- HEALTH BAR
 --========================================================
-local _, HealthBar =
-	createHealthBar(ScreenGui, 1)
+-- 2006 style, measured off RetroStudio on a phone: a thin green bar a little in
+-- from the right edge, with "Health" in blue in the 2006 font right under it
+local HEALTH_GREEN =
+	Color3.new(
+		0.5058824,
+		0.7725491,
+		0.08627451
+	)
+local HealthFrame = Instance.new("Frame")
+HealthFrame.Name = "ClassicHealthFrame"
+HealthFrame.AnchorPoint = Vector2.new(0.5, 0)
+HealthFrame.Position = UDim2.new(0.877, 0, 0.556, 0)
+HealthFrame.Size = UDim2.new(0, 7, 0, 82)
+HealthFrame.BackgroundColor3 = Color3.fromRGB(255, 0, 0)
+HealthFrame.BorderSizePixel = 0
+HealthFrame.Parent = ScreenGui
+local HealthBar = Instance.new("Frame")
+HealthBar.Name = "Bar"
+HealthBar.Size = UDim2.new(1, 0, 1, 0)
+HealthBar.BackgroundColor3 = HEALTH_GREEN
+HealthBar.BorderSizePixel = 0
+HealthBar.Parent = HealthFrame
+local HealthLabel = Instance.new("TextLabel")
+HealthLabel.Name = "HealthLabel"
+HealthLabel.AnchorPoint = Vector2.new(0.5, 0)
+HealthLabel.Position = UDim2.new(0.5, 0, 1, 2)
+HealthLabel.Size = UDim2.new(0, 80, 0, 25)
+HealthLabel.BackgroundTransparency = 1
+HealthLabel.Text = "Health"
+HealthLabel.TextColor3 = Color3.fromRGB(0, 0, 255)
+HealthLabel.TextSize = 21
+HealthLabel.TextYAlignment = Enum.TextYAlignment.Top
+HealthLabel.Parent = HealthFrame
+apply2006Font(HealthLabel)
 local function setupHealthTracking(character)
 	local humanoid =
 		character:WaitForChild(
@@ -2199,6 +2210,10 @@ storeConnection(
 		end
 
 		addClassicMessage(senderPlayer.Name, messageText)
+
+		if not SHOW_CHAT_BUBBLES then
+			return
+		end
 
 		local character = senderPlayer.Character
 		if not character then
